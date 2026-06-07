@@ -97,6 +97,7 @@ export default function App() {
 
   // Automated LMS Research states
   const [researchingLms, setResearchingLms] = useState(false);
+  const [isQuotaExceeded, setIsQuotaExceeded] = useState(false);
   const [researchResult, setResearchResult] = useState<{
     detectedLms: string;
     detectedName: string | null;
@@ -272,6 +273,9 @@ export default function App() {
         }),
       });
       const data = await response.json();
+      if (data && data.isQuotaExceeded) {
+        setIsQuotaExceeded(true);
+      }
       if (data && data.success) {
         setResearchResult({
           detectedLms: data.detectedLms,
@@ -348,6 +352,9 @@ export default function App() {
       });
 
       const data = await response.json();
+      if (data && data.isQuotaExceeded) {
+        setIsQuotaExceeded(true);
+      }
       if (data && data.success) {
         setEmailSubject(data.subject);
         setEmailBody(data.body);
@@ -560,6 +567,9 @@ export default function App() {
           body: JSON.stringify({ content: text, fileName: file.name, extension: customExtension || extension }),
         });
         const result = await response.json();
+        if (result && result.isQuotaExceeded) {
+          setIsQuotaExceeded(true);
+        }
         if (result && result.success && result.targets && result.targets.length > 0) {
           setUploadProgress(80);
           setUploadStatus("Refining trigger signal categorization...");
@@ -856,6 +866,27 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* Quota warning banner */}
+      {isQuotaExceeded && (
+        <div className="bg-amber-50 border-b border-amber-200 px-6 py-3.5 flex items-center justify-between gap-4 text-slate-800 text-xs">
+          <div className="max-w-7xl mx-auto w-full flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2.5">
+              <AlertCircle className="w-4.5 h-4.5 text-amber-600 shrink-0" />
+              <span>
+                <strong>Notice:</strong> Gemini API Quota Limit exceeded (resource exhausted / 429). The system has automatically activated its local heuristic template matching rules so your campaign outreach and targeting workflows can continue instantly. To restore real-time AI research, configure your API credential under the <strong>Settings &gt; Secrets</strong> panel.
+              </span>
+            </div>
+            <button 
+              type="button"
+              onClick={() => setIsQuotaExceeded(false)}
+              className="text-amber-800 hover:text-amber-950 font-bold uppercase tracking-wider text-[10px] bg-amber-200 hover:bg-amber-300 px-3 py-1 rounded cursor-pointer transition-colors whitespace-nowrap"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Main Container */}
       <main className="max-w-7xl mx-auto w-full px-4 sm:px-6 py-6 flex-1 flex flex-col gap-6">
