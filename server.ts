@@ -4,7 +4,7 @@ import dotenv from "dotenv";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const pdf = require("pdf-parse");
-import { GoogleGenAI, Type } from "@google/genai";
+import Anthropic from "@anthropic-ai/sdk";
 import { createServer as createViteServer } from "vite";
 
 // Load environment variables
@@ -15,12 +15,15 @@ app.use(express.json());
 
 const PORT = 3000;
 
-// Initialize Google GenAI
-let lastApiKey: string | undefined = undefined;
-let aiClient: GoogleGenAI | null = null;
+const RESEARCH_MODEL = "claude-sonnet-4-6";
+const GENERATION_MODEL = "claude-haiku-4-5-20251001";
 
-function getGenAIClient(): GoogleGenAI | null {
-  const currentKey = process.env.GEMINI_API_KEY;
+// Initialize Anthropic client
+let lastApiKey: string | undefined = undefined;
+let aiClient: Anthropic | null = null;
+
+function getAnthropicClient(): Anthropic | null {
+  const currentKey = process.env.ANTHROPIC_API_KEY;
   if (!currentKey) {
     aiClient = null;
     lastApiKey = undefined;
@@ -28,18 +31,11 @@ function getGenAIClient(): GoogleGenAI | null {
   }
   if (!aiClient || lastApiKey !== currentKey) {
     try {
-      aiClient = new GoogleGenAI({
-        apiKey: currentKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      });
+      aiClient = new Anthropic({ apiKey: currentKey });
       lastApiKey = currentKey;
-      console.log("Gemini API Client initialized/updated dynamically.");
+      console.log("Anthropic Claude Client initialized/updated dynamically.");
     } catch (err) {
-      console.warn("Notice: Error initializing Gemini API Client:", err);
+      console.warn("Notice: Error initializing Anthropic Client:", err);
       aiClient = null;
       lastApiKey = undefined;
     }
@@ -47,7 +43,7 @@ function getGenAIClient(): GoogleGenAI | null {
   return aiClient;
 }
 
-// Deterministic mock generation in case Gemini isn't available
+// Deterministic mock generation in case Claude isn't available
 function generateFallbackEmail(
   orgName: string,
   verticalDisplay: string,
@@ -72,7 +68,6 @@ function generateFallbackEmail(
   const hasNews = scrapedNews && Array.isArray(scrapedNews) && scrapedNews.length > 0;
   const topNews = hasNews ? scrapedNews![0] : null;
 
-  // Let's adjust content based on tone & readingLevel & triggerSignal/scrapedNews
   let openers: string[];
   if (topNews) {
     const cleanHeadline = (topNews.headline || "").replace(/[".']/g, "");
@@ -134,7 +129,6 @@ function generateFallbackEmail(
     ? `We specialize in assisting ${verticalDisplay} groups to streamline member onboarding, credit tracking, and educational resource distribution.`
     : `We're helping other ${verticalDisplay} groups move away from spreadsheets and simplify how members learn and track credits. It's built to keep them coming back.`;
 
-  // Naturally append includeKeywords if present
   if (includeKeywords) {
     const kwList = includeKeywords.split(",").map(k => k.trim()).filter(Boolean);
     if (kwList.length > 0) {
@@ -204,13 +198,11 @@ function sanitizeEmailBody(text: string, verticalDisplay: string, tone?: "formal
   let cleaned = text;
   const isFormal = tone === "formal";
   
-  // Replace typical LLM polite markers
   cleaned = cleaned.replace(/I hope this email finds you well/gi, "");
   cleaned = cleaned.replace(/I noticed you're using/gi, "");
   cleaned = cleaned.replace(/quick question/gi, "");
   cleaned = cleaned.replace(/just checking in/gi, "");
   
-  // Replace standard banned buzzwords with simpler alternatives
   cleaned = cleaned.replace(/leverage/gi, "use");
   cleaned = cleaned.replace(/solution/gi, "tool");
   cleaned = cleaned.replace(/robust/gi, "helpful");
@@ -226,7 +218,6 @@ function sanitizeEmailBody(text: string, verticalDisplay: string, tone?: "formal
   cleaned = cleaned.replace(/circle back/gi, "follow up");
   cleaned = cleaned.replace(/touch base/gi, "chat");
 
-  // Ensure it has some form of signoff
   const lowerCleaned = cleaned.toLowerCase();
   const hasPatSignoff = lowerCleaned.includes("\npat") || lowerCleaned.endsWith("\npat");
   if (!hasPatSignoff) {
@@ -250,7 +241,6 @@ const researchCache = new Map<string, {
   learningNews?: { headline: string; snippet: string; date?: string }[];
 }>();
 
-// Helper to generate context-specific placeholder learning news when GenAI is fallback-driven
 const generatePlaceholderNews = (org: string, vertId: string) => {
   const list = [];
   const v = vertId || "general_professional";
@@ -302,9 +292,91 @@ const generatePlaceholderNews = (org: string, vertId: string) => {
   return list;
 };
 
-// API endpoint to research and detect target LMS using Gemini intelligence
+// Helper: web search using Claude's web_search_20250305 server-side tool
+async function webSearchWithClaude(
+  query: string,
+  client: Anthropic
+): Promise<{ text: string; sources: { title: string; uri: string }[] }> {
+  const response = await client.messages.create({
+    model: RESEARCH_MODEL,
+    max_tokens: 4096,
+    tools: [{ type: "web_search_20250305", name: "web_search" } as any],
+    messages: [{ role: "user", content: query }],
+  });
+
+  let text = "";
+  const sources: { title: string; uri: string }[] = [];
+
+  for (const block of response.content) {
+    if (block.type === "text") {
+      text += block.text;
+    } else if ((block as any).type === "web_search_tool_result") {
+      const results = (block as any).content || [];
+      for (const r of results) {
+        if (r.url || r.uri) {
+          sources.push({ title: r.title || r.url || r.uri, uri: r.url || r.uri });
+        }
+      }
+    }
+  }
+
+  return { text, sources };
+}
+
+// Helper: structured JSON output via Claude tool_use
+async function callClaudeStructured<T>(
+  client: Anthropic,
+  model: string,
+  prompt: string,
+  toolName: string,
+  toolDescription: string,
+  inputSchema: object
+): Promise<T> {
+  const response = await client.messages.create({
+    model,
+    max_tokens: 4096,
+    tools: [{
+      name: toolName,
+      description: toolDescription,
+      input_schema: inputSchema as Anthropic.Tool["input_schema"],
+    }],
+    tool_choice: { type: "tool", name: toolName },
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const toolUse = response.content.find(
+    (b): b is Anthropic.ToolUseBlock => b.type === "tool_use" && (b as Anthropic.ToolUseBlock).name === toolName
+  );
+
+  if (!toolUse) {
+    throw new Error(`No structured response from Claude tool: ${toolName}`);
+  }
+
+  return toolUse.input as T;
+}
+
+// In-memory email artifact store (cloud-adapted HtmlPublishingAgent pattern)
+interface EmailArtifact {
+  id: string;
+  projectName: string;
+  title: string;
+  subject: string;
+  body: string;
+  orgName: string;
+  verticalId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const emailArtifactStore = new Map<string, EmailArtifact>();
+
+function slugifyProject(name: string): string {
+  return name.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "untitled";
+}
+
+// API endpoint to research and detect target LMS using Claude intelligence
 app.post("/api/research-lms", async (req, res) => {
-  const aiClient = getGenAIClient();
+  const client = getAnthropicClient();
   const { orgName, triggerSignal, verticalId, forceRegenerate } = req.body;
   if (!orgName) {
     return res.status(400).json({ error: "Organization name is required." });
@@ -316,7 +388,6 @@ app.post("/api/research-lms", async (req, res) => {
     return res.json({ success: true, ...researchCache.get(cacheKey) });
   }
 
-  // 1. Setup local resolver fallbacks in case Search Grounding API or Key is unavailable
   const orgLower = orgName.toLowerCase();
   const triggerLower = (triggerSignal || "").toLowerCase();
 
@@ -326,7 +397,6 @@ app.post("/api/research-lms", async (req, res) => {
   let explanation = "Inferred via context analytics.";
   let sources: { title: string; uri: string }[] = [];
 
-  // Exact or contains matches for known sample accounts
   if (orgLower.includes("pennsylvania bar")) {
     detectedLms = "forj";
     detectedName = "Forj (CommPartners)";
@@ -357,9 +427,7 @@ app.post("/api/research-lms", async (req, res) => {
     detectedName = "Litmos";
     confidence = 93;
     explanation = "Verified active Litmos instance footprint scheduled for system renewal review in 3 months.";
-  }
-  // Generic keyword fallback heuristics in trigger text or org name if target is new
-  else if (triggerLower.includes("forj") || triggerLower.includes("web courseworks") || triggerLower.includes("commpartners")) {
+  } else if (triggerLower.includes("forj") || triggerLower.includes("web courseworks") || triggerLower.includes("commpartners")) {
     detectedLms = "forj";
     detectedName = "Forj";
     confidence = 98;
@@ -406,7 +474,6 @@ app.post("/api/research-lms", async (req, res) => {
     explanation = "Detected custom homegrown system or no current LMS provider in the trigger signal.";
   }
 
-  // Define default empty lists and fallback structure ensuring genuine, verified-only information
   const noResearchFoundNews = [
     {
       headline: "No relevant information available",
@@ -414,8 +481,7 @@ app.post("/api/research-lms", async (req, res) => {
     }
   ];
 
-  // If there's no GEMINI_API_KEY, return the fallback right away without phony details
-  if (!aiClient) {
+  if (!client) {
     const result = {
       detectedLms,
       detectedName,
@@ -432,35 +498,19 @@ app.post("/api/research-lms", async (req, res) => {
     let activeSources: { title: string; uri: string }[] = [];
     let liveWebText = "";
 
-    // 1. Force an active dynamic web-search research call to get authentic sources & real content summaries
+    // 1. Live web-search via Claude web_search_20250305 server-side tool
     try {
       console.log(`[Research Log] Initiating live web-search lookup for target: "${orgName}"`);
-      const searchRes = await aiClient.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: `Determine the dynamic continuing education footprint for "${orgName}" by searching the web. Specifically focus on finding:
-1. What exact Learning Management System (LMS) or CE software platform they run (e.g. Forj/CommPartners, TopClass, Docebo, Litmos, Thought Industries, Path LMS / Blue Sky, Crowd Wisdom, or Moodle).
-2. The latest real professional training seminars, course catalog developments, active credit certificate changes, or online learning updates for "${orgName}".`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      });
-
-      liveWebText = searchRes.text || "";
-      const chunks = searchRes.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      if (chunks && Array.isArray(chunks)) {
-        for (const c of chunks) {
-          if (c.web && c.web.uri) {
-            activeSources.push({
-              title: c.web.title || "Scanned Web Footprint Page",
-              uri: c.web.uri
-            });
-          }
-        }
-      }
-      console.log(`[Research Log] Success! Placed search call. Extracted ${activeSources.length} authentic grounding links.`);
+      const searchResult = await webSearchWithClaude(
+        `Determine the dynamic continuing education footprint for "${orgName}" by searching the web. Specifically focus on finding:\n1. What exact Learning Management System (LMS) or CE software platform they run (e.g. Forj/CommPartners, TopClass, Docebo, Litmos, Thought Industries, Path LMS / Blue Sky, Crowd Wisdom, or Moodle).\n2. The latest real professional training seminars, course catalog developments, active credit certificate changes, or online learning updates for "${orgName}".`,
+        client
+      );
+      liveWebText = searchResult.text;
+      activeSources = searchResult.sources;
+      console.log(`[Research Log] Success! Web search complete. Extracted ${activeSources.length} sources.`);
     } catch (searchErr) {
       const isQuota = searchErr && (
-        String(searchErr).includes("RESOURCE_EXHAUSTED") ||
+        String(searchErr).includes("rate_limit_error") ||
         String(searchErr).includes("quota") ||
         String(searchErr).includes("429")
       );
@@ -494,60 +544,47 @@ ${liveWebText || "No live footprint summaries could be scraped."}
 - "unsure_research" (if absolutely no footprint references or vendor traces can be spotted on the web)
 
 2. Synthesize at least 2 highly relevant professional education, webinar catalog updates, or training announcements for "${orgName}" based on real content gathered.
-
-You must return EXACTLY this JSON structure:
-{
-  "detectedLms": "forj" | "topclass" | "docebo" | "thought_industries" | "blue_sky" | "litmos" | "crowd_wisdom" | "moodle" | "homegrown_or_none" | "unsure_research",
-  "detectedName": string | null, // Human-friendly company name like "Forj" or null
-  "confidence": number, // integer percentage 0-100 indicating scraping reliability
-  "explanation": "State clearly in 1 or 2 concise sentences what precise digital footprint, subdirectory login, portal, or press archive was scraped.",
-  "learningNews": [
-    {
-      "headline": "Headline of the recent continuing education news, professional certification update, training program, or course catalog launch",
-      "snippet": "1-2 sentence description detailing the learning curriculum, instructional upgrade, or digital transition found on the web",
-      "date": "Approximate date or timing if known, or 'Recent'"
-    }
-  ]
-}
 `;
 
-    const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: searchPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            detectedLms: { type: Type.STRING },
-            detectedName: { type: Type.STRING, nullable: true },
-            confidence: { type: Type.NUMBER },
-            explanation: { type: Type.STRING },
-            learningNews: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  headline: { type: Type.STRING },
-                  snippet: { type: Type.STRING },
-                  date: { type: Type.STRING, nullable: true }
-                },
-                required: ["headline", "snippet"]
-              }
+    interface ResearchResult {
+      detectedLms: string;
+      detectedName: string | null;
+      confidence: number;
+      explanation: string;
+      learningNews: { headline: string; snippet: string; date?: string }[];
+    }
+
+    const data = await callClaudeStructured<ResearchResult>(
+      client,
+      RESEARCH_MODEL,
+      searchPrompt,
+      "extract_lms_research",
+      "Extract LMS and continuing education news data for an organization based on web research",
+      {
+        type: "object",
+        properties: {
+          detectedLms: { type: "string" },
+          detectedName: { type: ["string", "null"] },
+          confidence: { type: "number" },
+          explanation: { type: "string" },
+          learningNews: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                headline: { type: "string" },
+                snippet: { type: "string" },
+                date: { type: ["string", "null"] }
+              },
+              required: ["headline", "snippet"]
             }
-          },
-          required: ["detectedLms", "detectedName", "explanation", "confidence", "learningNews"]
-        }
+          }
+        },
+        required: ["detectedLms", "detectedName", "explanation", "confidence", "learningNews"]
       }
-    });
+    );
 
-    const textInput = response.text || "{}";
-    const data = JSON.parse(textInput.trim());
-
-    // Use ONLY authentic google search grounding chunks. If no live web search matches were found, sources is empty.
     const finalSources = activeSources;
-
-    // If active sources is empty, or the generated news collection is empty, display the "No relevant information available" outcome
     const hasGenuineResearch = finalSources.length > 0;
     const finalNews = (hasGenuineResearch && Array.isArray(data.learningNews) && data.learningNews.length > 0)
       ? data.learningNews
@@ -569,13 +606,14 @@ You must return EXACTLY this JSON structure:
 
   } catch (error) {
     const isQuotaError = error && (
-      String(error).includes("RESOURCE_EXHAUSTED") ||
+      String(error).includes("rate_limit_error") ||
+      String(error).includes("overloaded_error") ||
       String(error).includes("quota") ||
       String(error).includes("429")
     );
 
     if (isQuotaError) {
-      console.log("Notice: Handled Gemini rate/quota exhaustion. Local heuristics matchmaking triggered.");
+      console.log("Notice: Handled Claude rate/quota exhaustion. Local heuristics matchmaking triggered.");
     } else {
       console.log("Notice: Target lookup path adjusted. Executing local heuristic fallback matches.");
     }
@@ -585,7 +623,7 @@ You must return EXACTLY this JSON structure:
       detectedName,
       confidence,
       explanation: isQuotaError
-        ? "NOTICE: Gemini API Free Quota Limit Exceeded. The system has automatically activated its fast heuristic catalog matching rule engine to resolve target specs."
+        ? "NOTICE: Anthropic API Rate Limit Exceeded. The system has automatically activated its fast heuristic catalog matching rule engine to resolve target specs."
         : `${explanation} (AI scraper checked web footprints with negative results)`,
       sources: [],
       learningNews: noResearchFoundNews,
@@ -597,7 +635,7 @@ You must return EXACTLY this JSON structure:
 
 // API endpoint to parse messy files (CSV, JSON, HTML, TXT, etc.) and map to standard dynamic schema
 app.post("/api/parse-messy-file", async (req, res) => {
-  const aiClient = getGenAIClient();
+  const client = getAnthropicClient();
   const { content, fileName, extension } = req.body;
   if (!content) {
     return res.status(400).json({ error: "Content is required for parsing." });
@@ -616,19 +654,15 @@ app.post("/api/parse-messy-file", async (req, res) => {
     }
   }
 
-  // Fallback programmatic parser in case AI isn't loaded/ready
   const fallbackParse = () => {
-    // Let's implement an incredibly robust fallback heuristic parser
     const parsed: any[] = [];
     const lines = contentToParse.split(/\r?\n/).map((l: string) => l.trim()).filter((l: string) => l.length > 0);
 
-    // Check if it looks like JSON
     if (contentToParse.trim().startsWith("[") || contentToParse.trim().startsWith("{")) {
-       try {
-         const parsedJson = JSON.parse(contentToParse);
+      try {
+        const parsedJson = JSON.parse(contentToParse);
         const list = Array.isArray(parsedJson) ? parsedJson : [parsedJson];
         for (const item of list) {
-          // Normalize properties dynamically
           const findKey = (candidates: string[]) => {
             for (const c of candidates) {
               const matched = Object.keys(item).find(k => k.toLowerCase().replace(/[^a-z0-9]/g, "").includes(c));
@@ -683,8 +717,6 @@ app.post("/api/parse-messy-file", async (req, res) => {
 
     if (parsed.length > 0) return parsed;
 
-    // Line/CSV fallback parsing
-    // Try simple regex matching or tab/comma scanning
     let isCsvLike = false;
     let separator = ",";
     for (const line of lines.slice(0, 5)) {
@@ -751,7 +783,6 @@ app.post("/api/parse-messy-file", async (req, res) => {
 
     if (parsed.length > 0) return parsed;
 
-    // Multi-line block extractor for clear text list (e.g. Org:, Vertical:, LMS:)
     let currentBlock: any = {};
     for (const l of lines) {
       const lower = l.toLowerCase();
@@ -810,10 +841,7 @@ app.post("/api/parse-messy-file", async (req, res) => {
       });
     }
 
-    // Absolutely raw paragraph layout parser (just pick some non-empty lines)
     if (parsed.length === 0 && lines.length > 0) {
-      // Create a single row out of whatever we found
-      // We can take lines as target entities if they don't look like code/html
       const candidateLines = lines.filter(line => line.length > 5 && !line.startsWith("<") && !line.startsWith("{"));
       if (candidateLines.length > 0) {
         parsed.push({
@@ -832,7 +860,6 @@ app.post("/api/parse-messy-file", async (req, res) => {
       }
     }
 
-    // Assure key mappings
     return parsed.map(t => ({
       ...t,
       verticalId: t.verticalId || "general_professional",
@@ -843,8 +870,8 @@ app.post("/api/parse-messy-file", async (req, res) => {
     }));
   };
 
-  if (!aiClient) {
-    console.log("No Gemini API Client for document parsing. Initiating client heuristics parser...");
+  if (!client) {
+    console.log("No Anthropic Client for document parsing. Initiating client heuristics parser...");
     return res.json({ success: true, targets: fallbackParse(), mode: "heuristic" });
   }
 
@@ -884,38 +911,49 @@ Guidelines:
    - "triggerSignal": This is the outbound spark or event. If the source material only provides an LMS name or basic details, you should synthesize a highly realistic, extremely compelling outbound pain trigger tailored to that segment (e.g., "Critical database integration sync issues reported between membership system and legacy LMS", "Regulatory renewal updates forcing evaluations of reliable CE catalog engines", "Annual contract renewal cycle initiating with current vendor"). Be vivid, professional, and convincing of why they are a target!
    - "contactName": Name or role of the contact person. If blank or unknown, use highly realistic default roles suited to the vertical (e.g., Jane Doe, or "Director of Education").
    - "contactTitle": Title or role of the contact person or standard fallback (e.g., "Education Coordinator" or "Member Services Administrator").
-
-Return a standard compliant JSON array of these objects.
 `;
 
-    const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              orgName: { type: Type.STRING },
-              verticalId: { type: Type.STRING },
-              lmsId: { type: Type.STRING },
-              triggerSignal: { type: Type.STRING },
-              contactName: { type: Type.STRING },
-              contactTitle: { type: Type.STRING }
-            },
-            required: ["orgName", "verticalId", "lmsId", "triggerSignal"]
+    interface ParsedTarget {
+      orgName: string;
+      verticalId: string;
+      lmsId: string;
+      triggerSignal: string;
+      contactName: string;
+      contactTitle: string;
+    }
+
+    const result = await callClaudeStructured<{ targets: ParsedTarget[] }>(
+      client,
+      GENERATION_MODEL,
+      prompt,
+      "extract_targets",
+      "Extract target organizations from uploaded file content for sales outreach",
+      {
+        type: "object",
+        properties: {
+          targets: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                orgName: { type: "string" },
+                verticalId: { type: "string" },
+                lmsId: { type: "string" },
+                triggerSignal: { type: "string" },
+                contactName: { type: "string" },
+                contactTitle: { type: "string" }
+              },
+              required: ["orgName", "verticalId", "lmsId", "triggerSignal"]
+            }
           }
-        }
+        },
+        required: ["targets"]
       }
-    });
+    );
 
-    const text = response.text || "[]";
-    const parsed = JSON.parse(text.trim());
+    const parsed = result.targets || [];
 
-    // Beautify the results with IDs and initial meta fields
-    const validated = parsed.map((item: any, idx: number) => {
+    const validated = parsed.map((item: ParsedTarget, idx: number) => {
       const vertValid = ["healthcare", "cpa_finance", "trade_manufacturing", "credentialing_board", "ce_provider", "general_professional"].includes(item.verticalId)
         ? item.verticalId
         : "general_professional";
@@ -944,7 +982,8 @@ Return a standard compliant JSON array of these objects.
 
   } catch (err) {
     const isQuotaError = err && (
-      String(err).includes("RESOURCE_EXHAUSTED") ||
+      String(err).includes("rate_limit_error") ||
+      String(err).includes("overloaded_error") ||
       String(err).includes("quota") ||
       String(err).includes("429")
     );
@@ -959,7 +998,7 @@ Return a standard compliant JSON array of these objects.
 
 // API endpoint to generate the email
 app.post("/api/generate-outreach", async (req, res) => {
-  const aiClient = getGenAIClient();
+  const client = getAnthropicClient();
   const {
     orgName,
     verticalId,
@@ -983,9 +1022,8 @@ app.post("/api/generate-outreach", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields." });
   }
 
-  // If no AI client, fall back instantly
-  if (!aiClient) {
-    console.log("No Gemini AI Client. Returning fallback outreach template.");
+  if (!client) {
+    console.log("No Anthropic Client. Returning fallback outreach template.");
     const fallback = generateFallbackEmail(
       orgName,
       verticalDisplay,
@@ -1075,47 +1113,38 @@ ${includeBlock}
 - Call to Action: Put a soft CTA like "Worth a quick chat?" or "Open to comparing notes?". If the tone profile is formal, you may use equivalent professional phrases like "Would you be open to a brief conversation?" or "Open to comparing notes?". Keep it extremely low pressure.
 - Sign off: Must end with "Pat" (or a professional variant like "Best regards,\nPat" if formal).
 - Subject Line: Provide a subject line under 6 words starting with "Subject: ". Use lowercase or sentence case. NO colons. E.g. "easy for members to find courses?" or "clunky certification workflows?".
-
-Respond with a JSON object in this format:
-{
-  "subject": "your subject line",
-  "body": "your cold email body"
-}
-Do not write any markdown wrappers around the JSON. Return only the raw JSON.
 `;
 
-    const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: "OBJECT",
-          properties: {
-            subject: { type: "STRING" },
-            body: { type: "STRING" }
-          },
-          required: ["subject", "body"]
-        }
+    interface OutreachEmail {
+      subject: string;
+      body: string;
+    }
+
+    const parsed = await callClaudeStructured<OutreachEmail>(
+      client,
+      GENERATION_MODEL,
+      prompt,
+      "generate_outreach_email",
+      "Generate a cold sales outreach email with subject line and body for a D2L sales representative",
+      {
+        type: "object",
+        properties: {
+          subject: { type: "string" },
+          body: { type: "string" }
+        },
+        required: ["subject", "body"]
       }
-    });
+    );
 
-    const responseText = response.text || "";
-    const parsed = JSON.parse(responseText.trim());
-
-    // Post-generation validation & safety sanitization
     let bodyFormatted = parsed.body || "";
     bodyFormatted = sanitizeEmailBody(bodyFormatted, verticalDisplay, tone);
 
     let subjectFormatted = parsed.subject || "";
-    // strip out colons
     subjectFormatted = subjectFormatted.replace(/:/g, "").replace(/subject/gi, "").trim();
 
-    // Word count safety check
     const wordCount = bodyFormatted.split(/\s+/).filter(Boolean).length;
-    console.log(`Gemini outreach email generated. Subject: "${subjectFormatted}". Word count: ${wordCount}`);
+    console.log(`Claude outreach email generated. Subject: "${subjectFormatted}". Word count: ${wordCount}`);
 
-    // If fusion angle is enabled, append the P.S. block cleanly
     if (fusionAngle) {
       if (tone === "formal") {
         const psBlock = `\n\nP.S. — D2L is hosting our annual Fusion Conference in Phoenix, July 8-10. Many ${verticalDisplay.toLowerCase()} leaders will be in attendance. Let me know if you plan to attend.`;
@@ -1140,7 +1169,8 @@ Do not write any markdown wrappers around the JSON. Return only the raw JSON.
   } catch (error) {
     console.warn("Outreach email generation fell back to high-quality template (API Limit/Offline is expected).");
     const isQuotaError = error && (
-      String(error).includes("RESOURCE_EXHAUSTED") ||
+      String(error).includes("rate_limit_error") ||
+      String(error).includes("overloaded_error") ||
       String(error).includes("quota") ||
       String(error).includes("429")
     );
@@ -1169,8 +1199,46 @@ Do not write any markdown wrappers around the JSON. Return only the raw JSON.
   }
 });
 
+// Publish email artifact (cloud-adapted HtmlPublishingAgent pattern — in-memory store)
+app.post("/api/publish-email", (req, res) => {
+  const { orgName, subject, body, verticalId } = req.body;
+  if (!orgName || !subject || !body) {
+    return res.status(400).json({ error: "orgName, subject, and body are required." });
+  }
+  const id = `artifact-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const now = new Date().toISOString();
+  const artifact: EmailArtifact = {
+    id,
+    projectName: slugifyProject(orgName),
+    title: `Outreach for ${orgName}`,
+    subject,
+    body,
+    orgName,
+    verticalId: verticalId || "general_professional",
+    createdAt: now,
+    updatedAt: now,
+  };
+  emailArtifactStore.set(id, artifact);
+  return res.json({ success: true, artifact });
+});
+
+// List all stored email artifacts
+app.get("/api/email-artifacts", (req, res) => {
+  const artifacts = Array.from(emailArtifactStore.values())
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return res.json({ success: true, artifacts });
+});
+
+// Get a specific email artifact by ID
+app.get("/api/email-artifacts/:id", (req, res) => {
+  const artifact = emailArtifactStore.get(req.params.id);
+  if (!artifact) {
+    return res.status(404).json({ error: "Artifact not found." });
+  }
+  return res.json({ success: true, artifact });
+});
+
 async function startServer() {
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
