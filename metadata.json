@@ -1,6 +1,6 @@
 {
   "name": "Displacement Angle Finder",
-  "description": "A trigger-based sales sidekick for D2L AEs powered by Anthropic Claude that ingests prospect spreadsheets and extracts real-time competitor displacement signals into a high-converting email outreach kit.",
+  "description": "A trigger-based sales sidekick for D2L AEs that ingests prospect spreadsheets and extracts real-time competitor displacement signals into a high-converting email outreach kit.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_CLAUDE_API"]
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
