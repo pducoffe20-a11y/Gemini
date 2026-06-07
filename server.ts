@@ -4,23 +4,25 @@ import dotenv from "dotenv";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const pdf = require("pdf-parse");
-import { GoogleGenAI, Type } from "@google/genai";
+import Anthropic from "@anthropic-ai/sdk";
 import { createServer as createViteServer } from "vite";
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = 3000;
 
-// Initialize Google GenAI
+// ──────────────────────────────────────────────────────────────────────────────
+// Anthropic Claude client  (replaces GoogleGenAI)
+// ──────────────────────────────────────────────────────────────────────────────
 let lastApiKey: string | undefined = undefined;
-let aiClient: GoogleGenAI | null = null;
+let aiClient: Anthropic | null = null;
 
-function getGenAIClient(): GoogleGenAI | null {
-  const currentKey = process.env.GEMINI_API_KEY;
+function getClient(): Anthropic | null {
+  const currentKey = process.env.ANTHROPIC_API_KEY;
   if (!currentKey) {
     aiClient = null;
     lastApiKey = undefined;
@@ -28,18 +30,11 @@ function getGenAIClient(): GoogleGenAI | null {
   }
   if (!aiClient || lastApiKey !== currentKey) {
     try {
-      aiClient = new GoogleGenAI({
-        apiKey: currentKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          },
-        },
-      });
+      aiClient = new Anthropic({ apiKey: currentKey });
       lastApiKey = currentKey;
-      console.log("Gemini API Client initialized/updated dynamically.");
+      console.log("Anthropic Claude client initialized/updated dynamically.");
     } catch (err) {
-      console.warn("Notice: Error initializing Gemini API Client:", err);
+      console.warn("Notice: Error initializing Anthropic client:", err);
       aiClient = null;
       lastApiKey = undefined;
     }
@@ -47,7 +42,137 @@ function getGenAIClient(): GoogleGenAI | null {
   return aiClient;
 }
 
-// Deterministic mock generation in case Gemini isn't available
+// Helper: call Claude with tool_use to get structured JSON output
+async function callClaudeStructured<T>(
+  client: Anthropic,
+  model: string,
+  toolName: string,
+  toolDescription: string,
+  inputSchema: Record<string, unknown>,
+  userPrompt: string,
+  maxTokens = 1024
+): Promise<T | null> {
+  const response = await client.messages.create({
+    model,
+    max_tokens: maxTokens,
+    tools: [{
+      name: toolName,
+      description: toolDescription,
+      input_schema: inputSchema as Anthropic.Tool["input_schema"],
+    }],
+    tool_choice: { type: "tool", name: toolName },
+    messages: [{ role: "user", content: userPrompt }],
+  });
+  const toolBlock = response.content.find(
+    (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
+  );
+  return toolBlock ? (toolBlock.input as T) : null;
+}
+
+// Helper: attempt live web search via Claude's web_search_20250305 server-side tool.
+// Falls back gracefully (returns empty text) when the tool is unavailable.
+async function webSearchWithClaude(
+  client: Anthropic,
+  query: string
+): Promise<{ text: string; sources: { title: string; uri: string }[] }> {
+  const sources: { title: string; uri: string }[] = [];
+  let allText = "";
+  try {
+    const messages: Anthropic.MessageParam[] = [{ role: "user", content: query }];
+    // web_search_20250305 is a server-side tool — cast to any to satisfy TS
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let response: Anthropic.Message = await (client.messages as any).create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2048,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages,
+    });
+    let iter = 0;
+    while (response.stop_reason === "tool_use" && iter++ < 4) {
+      const assistantContent = response.content;
+      messages.push({ role: "assistant", content: assistantContent });
+      const toolUseBlocks = assistantContent.filter(
+        (b): b is Anthropic.ToolUseBlock => b.type === "tool_use"
+      );
+      messages.push({
+        role: "user",
+        content: toolUseBlocks.map(b => ({
+          type: "tool_result" as const,
+          tool_use_id: b.id,
+          // For server-side tools, Anthropic injects the actual results server-side
+          content: [] as Anthropic.ToolResultBlockParam["content"],
+        })),
+      });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      response = await (client.messages as any).create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 2048,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages,
+      });
+    }
+    for (const block of response.content) {
+      if (block.type === "text") allText += block.text;
+    }
+  } catch (err) {
+    console.log("[WebSearch] Unavailable, using knowledge-only mode:", String(err).slice(0, 120));
+  }
+  return { text: allText, sources };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Email artifact store — adapted from HtmlPublishingAgent (Agents repo)
+// Cloud-native: uses in-memory Map instead of filesystem.
+// Preserves the same create/publish/list/retrieve semantics.
+// ──────────────────────────────────────────────────────────────────────────────
+interface EmailArtifact {
+  id: string;
+  orgName: string;
+  subject: string;
+  body: string;
+  html: string;
+  createdAt: string;
+  updatedAt: string;
+  verticalId?: string;
+  lmsId?: string;
+}
+const emailArtifactStore = new Map<string, EmailArtifact>();
+
+function artifactSlug(name: string): string {
+  const slug = name.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!slug) throw new Error("orgName must contain at least one alphanumeric character.");
+  return slug;
+}
+
+function renderEmailHtml(orgName: string, subject: string, body: string): string {
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${esc(subject)} — ${esc(orgName)}</title>
+  <style>
+    body{font-family:Georgia,serif;max-width:620px;margin:40px auto;padding:24px;color:#1a1a1a;line-height:1.7}
+    .meta{font-size:12px;color:#666;border-bottom:1px solid #eee;padding-bottom:12px;margin-bottom:24px}
+    .subject{font-size:18px;font-weight:bold;margin-bottom:20px}
+    .body{white-space:pre-wrap;font-size:15px}
+    .footer{margin-top:32px;font-size:11px;color:#aaa;border-top:1px solid #eee;padding-top:12px}
+  </style>
+</head>
+<body>
+  <div class="meta">To: ${esc(orgName)} &nbsp;·&nbsp; D2L Outreach Engine (Claude AI) &nbsp;·&nbsp; ${new Date().toLocaleDateString()}</div>
+  <div class="subject">Subject: ${esc(subject)}</div>
+  <div class="body">${esc(body).replace(/\n/g, "<br>")}</div>
+  <div class="footer">D2L Displacement Angle Finder — Claude Code Cloud Edition</div>
+</body>
+</html>`;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Deterministic mock generation (no AI needed) — identical to original
+// ──────────────────────────────────────────────────────────────────────────────
 function generateFallbackEmail(
   orgName: string,
   verticalDisplay: string,
@@ -60,19 +185,19 @@ function generateFallbackEmail(
   readingLevel?: number,
   tone?: "formal" | "informal",
   triggerSignal?: string,
-  scrapedNews?: any[]
+  scrapedNews?: {headline: string; snippet: string; date?: string}[]
 ): { subject: string; body: string } {
   const isFormal = tone === "formal";
-  const displayLevel = readingLevel || 6;
 
-  const cleanLmsDisplayName = (lmsDisplayName || "").includes("Auto-Research") || (lmsDisplayName || "").toLowerCase().includes("unknown") || (lmsDisplayName || "").toLowerCase().includes("unsure")
+  const cleanLmsDisplayName = (lmsDisplayName || "").includes("Auto-Research") ||
+    (lmsDisplayName || "").toLowerCase().includes("unknown") ||
+    (lmsDisplayName || "").toLowerCase().includes("unsure")
     ? "your current training system"
     : lmsDisplayName;
 
   const hasNews = scrapedNews && Array.isArray(scrapedNews) && scrapedNews.length > 0;
   const topNews = hasNews ? scrapedNews![0] : null;
 
-  // Let's adjust content based on tone & readingLevel & triggerSignal/scrapedNews
   let openers: string[];
   if (topNews) {
     const cleanHeadline = (topNews.headline || "").replace(/[".']/g, "");
@@ -112,9 +237,9 @@ function generateFallbackEmail(
           `A peer mentioned that keeping CE credit hours aligned with ${cleanLmsDisplayName} gets clunky — was curious if you're seeing the same.`
         ];
   }
-  
+
   const opener = openers[Math.floor(Math.random() * openers.length)];
-  
+
   let bodyIntro = "";
   if (topNews) {
     bodyIntro = isFormal
@@ -129,12 +254,11 @@ function generateFallbackEmail(
       ? `We understand that groups utilizing ${cleanLmsDisplayName} can occasionally encounter friction. Specifically, feedback indicates: "${painPointUserVoice}"`
       : `We've been hearing that with ${cleanLmsDisplayName}, things can feel a bit sluggish. Specifically, we often hear: "${painPointUserVoice}"`;
   }
-  
+
   let bodyBody = isFormal
     ? `We specialize in assisting ${verticalDisplay} groups to streamline member onboarding, credit tracking, and educational resource distribution.`
     : `We're helping other ${verticalDisplay} groups move away from spreadsheets and simplify how members learn and track credits. It's built to keep them coming back.`;
 
-  // Naturally append includeKeywords if present
   if (includeKeywords) {
     const kwList = includeKeywords.split(",").map(k => k.trim()).filter(Boolean);
     if (kwList.length > 0) {
@@ -157,15 +281,15 @@ function generateFallbackEmail(
       ];
   const cta = ctas[Math.floor(Math.random() * ctas.length)];
   const signoff = isFormal ? "Best regards,\nPat" : "Pat";
-  
+
   let body = `${opener}\n\n${bodyIntro}\n\n${bodyBody}\n\n${cta}\n\n${signoff}`;
-  
+
   if (fusionAngle) {
     body += isFormal
       ? `\n\nP.S. — D2L is hosting our annual Fusion Conference in Phoenix, July 8-10. Many ${verticalDisplay.toLowerCase()} leaders will be in attendance. Let me know if you plan to attend.`
       : `\n\nP.S. — we're hosting Fusion in Phoenix July 8-10, lot of ${verticalDisplay.toLowerCase()} folks will be there. Worth grabbing 15 min if you're going?`;
   }
-  
+
   const subjectOptions = topNews
     ? [
         `news question for ${orgName}`,
@@ -173,7 +297,7 @@ function generateFallbackEmail(
         `${orgName} learning initiative update`,
         `easy for members to track credits?`
       ]
-    : triggerSignal 
+    : triggerSignal
     ? [
         `quick question on ${orgName}'s transition`,
         `adjusting to ${triggerSignal}?`,
@@ -187,7 +311,7 @@ function generateFallbackEmail(
         `simplify ${verticalDisplay.toLowerCase()} training?`
       ];
   const subject = subjectOptions[Math.floor(Math.random() * subjectOptions.length)];
-  
+
   return { subject, body };
 }
 
@@ -199,18 +323,13 @@ const BANNED_WORDS = [
   "I noticed you're using", "quick question", "just checking in"
 ];
 
-// Helper to double check and clean any banned words or fix formatting
 function sanitizeEmailBody(text: string, verticalDisplay: string, tone?: "formal" | "informal"): string {
   let cleaned = text;
   const isFormal = tone === "formal";
-  
-  // Replace typical LLM polite markers
   cleaned = cleaned.replace(/I hope this email finds you well/gi, "");
   cleaned = cleaned.replace(/I noticed you're using/gi, "");
   cleaned = cleaned.replace(/quick question/gi, "");
   cleaned = cleaned.replace(/just checking in/gi, "");
-  
-  // Replace standard banned buzzwords with simpler alternatives
   cleaned = cleaned.replace(/leverage/gi, "use");
   cleaned = cleaned.replace(/solution/gi, "tool");
   cleaned = cleaned.replace(/robust/gi, "helpful");
@@ -225,8 +344,6 @@ function sanitizeEmailBody(text: string, verticalDisplay: string, tone?: "formal
   cleaned = cleaned.replace(/cutting-edge/gi, "modern");
   cleaned = cleaned.replace(/circle back/gi, "follow up");
   cleaned = cleaned.replace(/touch base/gi, "chat");
-
-  // Ensure it has some form of signoff
   const lowerCleaned = cleaned.toLowerCase();
   const hasPatSignoff = lowerCleaned.includes("\npat") || lowerCleaned.endsWith("\npat");
   if (!hasPatSignoff) {
@@ -236,7 +353,6 @@ function sanitizeEmailBody(text: string, verticalDisplay: string, tone?: "formal
       cleaned = cleaned.trim() + "\n\nPat";
     }
   }
-
   return cleaned;
 }
 
@@ -250,7 +366,6 @@ const researchCache = new Map<string, {
   learningNews?: { headline: string; snippet: string; date?: string }[];
 }>();
 
-// Helper to generate context-specific placeholder learning news when GenAI is fallback-driven
 const generatePlaceholderNews = (org: string, vertId: string) => {
   const list = [];
   const v = vertId || "general_professional";
@@ -302,9 +417,11 @@ const generatePlaceholderNews = (org: string, vertId: string) => {
   return list;
 };
 
-// API endpoint to research and detect target LMS using Gemini intelligence
+// ──────────────────────────────────────────────────────────────────────────────
+// POST /api/research-lms — detect target org's LMS using Claude + web search
+// ──────────────────────────────────────────────────────────────────────────────
 app.post("/api/research-lms", async (req, res) => {
-  const aiClient = getGenAIClient();
+  const client = getClient();
   const { orgName, triggerSignal, verticalId, forceRegenerate } = req.body;
   if (!orgName) {
     return res.status(400).json({ error: "Organization name is required." });
@@ -316,7 +433,7 @@ app.post("/api/research-lms", async (req, res) => {
     return res.json({ success: true, ...researchCache.get(cacheKey) });
   }
 
-  // 1. Setup local resolver fallbacks in case Search Grounding API or Key is unavailable
+  // ——— Heuristic / exact-match LMS detection (runs even without AI) ———
   const orgLower = orgName.toLowerCase();
   const triggerLower = (triggerSignal || "").toLowerCase();
 
@@ -324,243 +441,163 @@ app.post("/api/research-lms", async (req, res) => {
   let detectedName: string | null = null;
   let confidence = 50;
   let explanation = "Inferred via context analytics.";
-  let sources: { title: string; uri: string }[] = [];
 
-  // Exact or contains matches for known sample accounts
   if (orgLower.includes("pennsylvania bar")) {
-    detectedLms = "forj";
-    detectedName = "Forj (CommPartners)";
-    confidence = 96;
+    detectedLms = "forj"; detectedName = "Forj (CommPartners)"; confidence = 96;
     explanation = "Platform intelligence identifies legacy Forj usage based on administrative overage structures.";
   } else if (orgLower.includes("michigan nurses")) {
-    detectedLms = "topclass";
-    detectedName = "TopClass (WBT Systems)";
-    confidence = 95;
+    detectedLms = "topclass"; detectedName = "TopClass (WBT Systems)"; confidence = 95;
     explanation = "Intelligence data confirms compliance issues in their local TopClass validation flow.";
   } else if (orgLower.includes("ohio society of cpa")) {
-    detectedLms = "forj";
-    detectedName = "Forj (CommPartners)";
-    confidence = 92;
+    detectedLms = "forj"; detectedName = "Forj (CommPartners)"; confidence = 92;
     explanation = "Inferred legacy Forj portal deployment via continuous catalog delay analysis.";
   } else if (orgLower.includes("great lakes")) {
-    detectedLms = "docebo";
-    detectedName = "Docebo";
-    confidence = 94;
+    detectedLms = "docebo"; detectedName = "Docebo"; confidence = 94;
     explanation = "Platform telemetry identifies that the target is operating on a Docebo Enterprise structure.";
   } else if (orgLower.includes("texas medical")) {
-    detectedLms = "thought_industries";
-    detectedName = "Thought Industries";
-    confidence = 95;
+    detectedLms = "thought_industries"; detectedName = "Thought Industries"; confidence = 95;
     explanation = "Identified legacy Thought Industries structure following automated procurement reviews.";
   } else if (orgLower.includes("national cpa")) {
-    detectedLms = "litmos";
-    detectedName = "Litmos";
-    confidence = 93;
+    detectedLms = "litmos"; detectedName = "Litmos"; confidence = 93;
     explanation = "Verified active Litmos instance footprint scheduled for system renewal review in 3 months.";
-  }
-  // Generic keyword fallback heuristics in trigger text or org name if target is new
-  else if (triggerLower.includes("forj") || triggerLower.includes("web courseworks") || triggerLower.includes("commpartners")) {
-    detectedLms = "forj";
-    detectedName = "Forj";
-    confidence = 98;
+  } else if (triggerLower.includes("forj") || triggerLower.includes("web courseworks") || triggerLower.includes("commpartners")) {
+    detectedLms = "forj"; detectedName = "Forj"; confidence = 98;
     explanation = "Detected 'Forj' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("topclass") || triggerLower.includes("top class") || triggerLower.includes("wbt system")) {
-    detectedLms = "topclass";
-    detectedName = "TopClass";
-    confidence = 98;
+    detectedLms = "topclass"; detectedName = "TopClass"; confidence = 98;
     explanation = "Detected 'TopClass' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("docebo")) {
-    detectedLms = "docebo";
-    detectedName = "Docebo";
-    confidence = 98;
+    detectedLms = "docebo"; detectedName = "Docebo"; confidence = 98;
     explanation = "Detected 'Docebo' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("litmos")) {
-    detectedLms = "litmos";
-    detectedName = "Litmos";
-    confidence = 98;
+    detectedLms = "litmos"; detectedName = "Litmos"; confidence = 98;
     explanation = "Detected 'Litmos' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("blue sky") || triggerLower.includes("bluesky") || triggerLower.includes("path lms")) {
-    detectedLms = "blue_sky";
-    detectedName = "Blue Sky eLearn / Path LMS";
-    confidence = 98;
+    detectedLms = "blue_sky"; detectedName = "Blue Sky eLearn / Path LMS"; confidence = 98;
     explanation = "Detected 'Blue Sky' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("crowd wisdom") || triggerLower.includes("cadmium")) {
-    detectedLms = "crowd_wisdom";
-    detectedName = "Crowd Wisdom (Cadmium)";
-    confidence = 98;
+    detectedLms = "crowd_wisdom"; detectedName = "Crowd Wisdom (Cadmium)"; confidence = 98;
     explanation = "Detected 'Crowd Wisdom' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("thought industries") || triggerLower.includes("thought-industries")) {
-    detectedLms = "thought_industries";
-    detectedName = "Thought Industries";
-    confidence = 98;
+    detectedLms = "thought_industries"; detectedName = "Thought Industries"; confidence = 98;
     explanation = "Detected 'Thought Industries' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("moodle")) {
-    detectedLms = "moodle";
-    detectedName = "Moodle";
-    confidence = 95;
+    detectedLms = "moodle"; detectedName = "Moodle"; confidence = 95;
     explanation = "Detected 'Moodle' mentioned in the trigger signal text.";
   } else if (triggerLower.includes("homegrown") || triggerLower.includes("self-built") || triggerLower.includes("custom lms")) {
-    detectedLms = "homegrown_or_none";
-    detectedName = "Homegrown Platform";
-    confidence = 90;
+    detectedLms = "homegrown_or_none"; detectedName = "Homegrown Platform"; confidence = 90;
     explanation = "Detected custom homegrown system or no current LMS provider in the trigger signal.";
   }
 
-  // Define default empty lists and fallback structure ensuring genuine, verified-only information
-  const noResearchFoundNews = [
-    {
-      headline: "No relevant information available",
-      snippet: "No active public continuing education, webinar, or learning management system footprint could be found on the web for this organization."
-    }
-  ];
+  const noResearchFoundNews = [{
+    headline: "No relevant information available",
+    snippet: "No active public continuing education, webinar, or learning management system footprint could be found on the web for this organization."
+  }];
 
-  // If there's no GEMINI_API_KEY, return the fallback right away without phony details
-  if (!aiClient) {
-    const result = {
-      detectedLms,
-      detectedName,
-      confidence,
-      explanation,
-      sources: [],
-      learningNews: noResearchFoundNews
-    };
+  if (!client) {
+    const result = { detectedLms, detectedName, confidence, explanation, sources: [], learningNews: noResearchFoundNews };
     researchCache.set(cacheKey, result);
     return res.json({ success: true, ...result });
   }
 
   try {
-    let activeSources: { title: string; uri: string }[] = [];
+    // ——— Step 1: Attempt live web search via Claude's web_search tool ———
     let liveWebText = "";
-
-    // 1. Force an active dynamic web-search research call to get authentic sources & real content summaries
+    let activeSources: { title: string; uri: string }[] = [];
     try {
-      console.log(`[Research Log] Initiating live web-search lookup for target: "${orgName}"`);
-      const searchRes = await aiClient.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: `Determine the dynamic continuing education footprint for "${orgName}" by searching the web. Specifically focus on finding:
-1. What exact Learning Management System (LMS) or CE software platform they run (e.g. Forj/CommPartners, TopClass, Docebo, Litmos, Thought Industries, Path LMS / Blue Sky, Crowd Wisdom, or Moodle).
-2. The latest real professional training seminars, course catalog developments, active credit certificate changes, or online learning updates for "${orgName}".`,
-        config: {
-          tools: [{ googleSearch: {} }]
-        }
-      });
-
-      liveWebText = searchRes.text || "";
-      const chunks = searchRes.candidates?.[0]?.groundingMetadata?.groundingChunks;
-      if (chunks && Array.isArray(chunks)) {
-        for (const c of chunks) {
-          if (c.web && c.web.uri) {
-            activeSources.push({
-              title: c.web.title || "Scanned Web Footprint Page",
-              uri: c.web.uri
-            });
-          }
-        }
-      }
-      console.log(`[Research Log] Success! Placed search call. Extracted ${activeSources.length} authentic grounding links.`);
+      console.log(`[Research Log] Initiating Claude web-search lookup for: "${orgName}"`);
+      const searchQuery = `Determine the continuing education footprint for "${orgName}" by searching the web. Find:
+1. What exact Learning Management System (LMS) they run (Forj/CommPartners, TopClass, Docebo, Litmos, Thought Industries, Path LMS/Blue Sky, Crowd Wisdom/Cadmium, or Moodle).
+2. The latest professional training seminars, course catalog developments, or online learning updates for "${orgName}".`;
+      const { text, sources } = await webSearchWithClaude(client, searchQuery);
+      liveWebText = text;
+      activeSources = sources;
+      console.log(`[Research Log] Web search complete. Got ${liveWebText.length} chars, ${activeSources.length} sources.`);
     } catch (searchErr) {
-      const isQuota = searchErr && (
-        String(searchErr).includes("RESOURCE_EXHAUSTED") ||
-        String(searchErr).includes("quota") ||
-        String(searchErr).includes("429")
-      );
-      if (isQuota) {
-        console.log("Live inquiry grounding limits exceeded. Propagating rate limit state.");
-        throw searchErr;
-      } else {
-        console.log("Live inquiry search lookup: inactive search footprints detected.");
-      }
+      const isQuota = searchErr instanceof Anthropic.RateLimitError ||
+        String(searchErr).includes("429");
+      if (isQuota) throw searchErr;
+      console.log("[Research] Search lookup inactive, using Claude knowledge only.");
     }
 
+    // ——— Step 2: Classify with Claude structured output ———
     const searchPrompt = `
-You are an advanced digital tech stack auditor and real-time sales intelligence web scraper model.
+You are an advanced digital tech stack auditor and sales intelligence analyst.
 Analyze target organization "${orgName}" under the vertical "${verticalId || "general"}".
 
-We have pre-fetched live searches and received active web context:
+Web research context (may be empty if search was unavailable):
 """
-${liveWebText || "No live footprint summaries could be scraped."}
+${liveWebText || "No live web footprint found."}
 """
 
-1. Classify your findings strictly as EXACTLY one of:
-- "forj" (Forj/CommPartners)
-- "topclass" (TopClass/WBT)
+1. Classify the organization's LMS as EXACTLY one of:
+- "forj" (Forj/CommPartners/Web Courseworks)
+- "topclass" (TopClass/WBT Systems)
 - "docebo" (Docebo)
 - "thought_industries" (Thought Industries)
-- "blue_sky" (Blue Sky / Path LMS)
+- "blue_sky" (Blue Sky eLearn / Path LMS)
 - "litmos" (Litmos)
-- "crowd_wisdom" (Crowd Wisdom/Cadmium)
+- "crowd_wisdom" (Crowd Wisdom / Cadmium)
 - "moodle" (Moodle)
-- "homegrown_or_none" (proprietarily custom built inside membership system or no platform)
-- "unsure_research" (if absolutely no footprint references or vendor traces can be spotted on the web)
+- "homegrown_or_none" (custom-built or no LMS)
+- "unsure_research" (no footprint found)
 
-2. Synthesize at least 2 highly relevant professional education, webinar catalog updates, or training announcements for "${orgName}" based on real content gathered.
+2. Synthesize at least 2 relevant professional education news items or training announcements for "${orgName}" based on context gathered.`;
 
-You must return EXACTLY this JSON structure:
-{
-  "detectedLms": "forj" | "topclass" | "docebo" | "thought_industries" | "blue_sky" | "litmos" | "crowd_wisdom" | "moodle" | "homegrown_or_none" | "unsure_research",
-  "detectedName": string | null, // Human-friendly company name like "Forj" or null
-  "confidence": number, // integer percentage 0-100 indicating scraping reliability
-  "explanation": "State clearly in 1 or 2 concise sentences what precise digital footprint, subdirectory login, portal, or press archive was scraped.",
-  "learningNews": [
-    {
-      "headline": "Headline of the recent continuing education news, professional certification update, training program, or course catalog launch",
-      "snippet": "1-2 sentence description detailing the learning curriculum, instructional upgrade, or digital transition found on the web",
-      "date": "Approximate date or timing if known, or 'Recent'"
-    }
-  ]
-}
-`;
-
-    const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: searchPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            detectedLms: { type: Type.STRING },
-            detectedName: { type: Type.STRING, nullable: true },
-            confidence: { type: Type.NUMBER },
-            explanation: { type: Type.STRING },
-            learningNews: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  headline: { type: Type.STRING },
-                  snippet: { type: Type.STRING },
-                  date: { type: Type.STRING, nullable: true }
-                },
-                required: ["headline", "snippet"]
-              }
-            }
+    const data = await callClaudeStructured<{
+      detectedLms: string;
+      detectedName: string | null;
+      confidence: number;
+      explanation: string;
+      learningNews: { headline: string; snippet: string; date?: string }[];
+    }>(
+      client,
+      "claude-haiku-4-5-20251001",
+      "classify_lms",
+      "Classify the organization's LMS and extract recent learning news",
+      {
+        type: "object",
+        properties: {
+          detectedLms: {
+            type: "string",
+            enum: ["forj", "topclass", "docebo", "thought_industries", "blue_sky",
+                   "litmos", "crowd_wisdom", "moodle", "homegrown_or_none", "unsure_research"]
           },
-          required: ["detectedLms", "detectedName", "explanation", "confidence", "learningNews"]
-        }
-      }
-    });
+          detectedName: { type: "string" },
+          confidence: { type: "number" },
+          explanation: { type: "string" },
+          learningNews: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                headline: { type: "string" },
+                snippet: { type: "string" },
+                date: { type: "string" }
+              },
+              required: ["headline", "snippet"]
+            }
+          }
+        },
+        required: ["detectedLms", "detectedName", "confidence", "explanation", "learningNews"]
+      },
+      searchPrompt,
+      1024
+    );
 
-    const textInput = response.text || "{}";
-    const data = JSON.parse(textInput.trim());
-
-    // Use ONLY authentic google search grounding chunks. If no live web search matches were found, sources is empty.
-    const finalSources = activeSources;
-
-    // If active sources is empty, or the generated news collection is empty, display the "No relevant information available" outcome
-    const hasGenuineResearch = finalSources.length > 0;
-    const finalNews = (hasGenuineResearch && Array.isArray(data.learningNews) && data.learningNews.length > 0)
+    const hasGenuineResearch = activeSources.length > 0;
+    const finalNews = data && hasGenuineResearch && Array.isArray(data.learningNews) && data.learningNews.length > 0
       ? data.learningNews
       : noResearchFoundNews;
 
     const result = {
-      detectedLms: detectedLms !== "unsure_research" ? detectedLms : (data.detectedLms || "unsure_research"),
-      detectedName: detectedName ? detectedName : (data.detectedName || null),
-      confidence: detectedLms !== "unsure_research" ? confidence : (data.confidence || 75),
-      explanation: detectedLms !== "unsure_research" 
-        ? `${explanation} Scraped audit notes: ${data.explanation}` 
-        : (data.explanation || "No certified vendor footprint uncovered. Proceeding with standard trigger templates."),
-      sources: finalSources,
+      detectedLms: detectedLms !== "unsure_research" ? detectedLms : (data?.detectedLms || "unsure_research"),
+      detectedName: detectedName ? detectedName : (data?.detectedName || null),
+      confidence: detectedLms !== "unsure_research" ? confidence : (data?.confidence || 75),
+      explanation: detectedLms !== "unsure_research"
+        ? `${explanation}${data?.explanation ? ` Claude audit: ${data.explanation}` : ""}`
+        : (data?.explanation || "No certified vendor footprint uncovered. Proceeding with standard trigger templates."),
+      sources: activeSources,
       learningNews: finalNews
     };
 
@@ -568,16 +605,13 @@ You must return EXACTLY this JSON structure:
     return res.json({ success: true, ...result });
 
   } catch (error) {
-    const isQuotaError = error && (
-      String(error).includes("RESOURCE_EXHAUSTED") ||
-      String(error).includes("quota") ||
-      String(error).includes("429")
-    );
+    const isQuotaError = error instanceof Anthropic.RateLimitError ||
+      (error && String(error).includes("429"));
 
     if (isQuotaError) {
-      console.log("Notice: Handled Gemini rate/quota exhaustion. Local heuristics matchmaking triggered.");
+      console.log("Notice: Claude rate limit hit. Activating local heuristic matchmaking.");
     } else {
-      console.log("Notice: Target lookup path adjusted. Executing local heuristic fallback matches.");
+      console.log("Notice: Claude research call failed. Executing local heuristic fallback.");
     }
 
     const result = {
@@ -585,8 +619,8 @@ You must return EXACTLY this JSON structure:
       detectedName,
       confidence,
       explanation: isQuotaError
-        ? "NOTICE: Gemini API Free Quota Limit Exceeded. The system has automatically activated its fast heuristic catalog matching rule engine to resolve target specs."
-        : `${explanation} (AI scraper checked web footprints with negative results)`,
+        ? "NOTICE: Claude API rate limit reached. The system has activated its fast heuristic catalog matching engine."
+        : `${explanation} (Claude scraper returned no results for this target)`,
       sources: [],
       learningNews: noResearchFoundNews,
       isQuotaExceeded: !!isQuotaError
@@ -595,9 +629,11 @@ You must return EXACTLY this JSON structure:
   }
 });
 
-// API endpoint to parse messy files (CSV, JSON, HTML, TXT, etc.) and map to standard dynamic schema
+// ──────────────────────────────────────────────────────────────────────────────
+// POST /api/parse-messy-file — parse uploaded files into structured target list
+// ──────────────────────────────────────────────────────────────────────────────
 app.post("/api/parse-messy-file", async (req, res) => {
-  const aiClient = getGenAIClient();
+  const client = getClient();
   const { content, fileName, extension } = req.body;
   if (!content) {
     return res.status(400).json({ error: "Content is required for parsing." });
@@ -616,19 +652,18 @@ app.post("/api/parse-messy-file", async (req, res) => {
     }
   }
 
-  // Fallback programmatic parser in case AI isn't loaded/ready
+  // ——— Pure-JS heuristic fallback parser (no AI required) ———
   const fallbackParse = () => {
-    // Let's implement an incredibly robust fallback heuristic parser
-    const parsed: any[] = [];
+    const parsed: {id: string; orgName: string; verticalId: string; lmsId: string;
+      triggerSignal: string; contactName: string; contactTitle: string;
+      confidence: number; status: string; hasCredential: boolean; fusionAngle: boolean}[] = [];
     const lines = contentToParse.split(/\r?\n/).map((l: string) => l.trim()).filter((l: string) => l.length > 0);
 
-    // Check if it looks like JSON
     if (contentToParse.trim().startsWith("[") || contentToParse.trim().startsWith("{")) {
-       try {
-         const parsedJson = JSON.parse(contentToParse);
+      try {
+        const parsedJson = JSON.parse(contentToParse);
         const list = Array.isArray(parsedJson) ? parsedJson : [parsedJson];
         for (const item of list) {
-          // Normalize properties dynamically
           const findKey = (candidates: string[]) => {
             for (const c of candidates) {
               const matched = Object.keys(item).find(k => k.toLowerCase().replace(/[^a-z0-9]/g, "").includes(c));
@@ -636,21 +671,19 @@ app.post("/api/parse-messy-file", async (req, res) => {
             }
             return "";
           };
-
           const org = findKey(["org", "company", "name", "association", "customer", "client", "title"]);
           if (org) {
             const rawV = String(findKey(["vert", "industry", "sector", "type"])).toLowerCase();
             let verticalId = "general_professional";
             if (rawV.includes("health") || rawV.includes("nurse") || rawV.includes("med") || rawV.includes("clinic")) verticalId = "healthcare";
             else if (rawV.includes("cpa") || rawV.includes("finance") || rawV.includes("tax")) verticalId = "cpa_finance";
-            else if (rawV.includes("trade") || rawV.includes("manuf") || rawV.includes("construction") || rawV.includes("mechanic")) verticalId = "trade_manufacturing";
+            else if (rawV.includes("trade") || rawV.includes("manuf") || rawV.includes("construction")) verticalId = "trade_manufacturing";
             else if (rawV.includes("board") || rawV.includes("cred") || rawV.includes("cert")) verticalId = "credentialing_board";
             else if (rawV.includes("ce") || rawV.includes("prov")) verticalId = "ce_provider";
-
             const rawL = String(findKey(["lms", "platform", "system", "software"])).toLowerCase();
             let lmsId = "unsure_research";
             if (rawL.includes("forj") || rawL.includes("comm") || rawL.includes("web course")) lmsId = "forj";
-            else if (rawL.includes("topclass") || rawL.includes("wbt") || rawL.includes("systems")) lmsId = "topclass";
+            else if (rawL.includes("topclass") || rawL.includes("wbt")) lmsId = "topclass";
             else if (rawL.includes("docebo")) lmsId = "docebo";
             else if (rawL.includes("thought") || rawL.includes("indust")) lmsId = "thought_industries";
             else if (rawL.includes("blue") || rawL.includes("path")) lmsId = "blue_sky";
@@ -658,33 +691,23 @@ app.post("/api/parse-messy-file", async (req, res) => {
             else if (rawL.includes("crowd") || rawL.includes("cadm")) lmsId = "crowd_wisdom";
             else if (rawL.includes("moodle")) lmsId = "moodle";
             else if (rawL.includes("home") || rawL.includes("none")) lmsId = "homegrown_or_none";
-
             const trigger = findKey(["trigger", "signal", "news", "event", "pain", "comment", "note"]) || "General industry review cyclical initiative.";
-
             parsed.push({
               id: `messy-json-${Date.now()}-${Math.random()}`,
               orgName: String(org).trim(),
-              verticalId,
-              lmsId,
+              verticalId, lmsId,
               triggerSignal: String(trigger).trim(),
               contactName: String(findKey(["contact", "exec", "person", "lead", "owner", "admin"])).trim() || "CE Compliance Director",
               contactTitle: String(findKey(["title", "role"])).trim() || "Education Services Manager",
-              confidence: 85,
-              status: "Target",
-              hasCredential: true,
-              fusionAngle: true
+              confidence: 85, status: "Target", hasCredential: true, fusionAngle: true
             });
           }
         }
-      } catch (err) {
-        // Not JSON, continue to other text fallback parses
-      }
+      } catch (_) { /* not JSON, continue */ }
     }
 
     if (parsed.length > 0) return parsed;
 
-    // Line/CSV fallback parsing
-    // Try simple regex matching or tab/comma scanning
     let isCsvLike = false;
     let separator = ",";
     for (const line of lines.slice(0, 5)) {
@@ -701,7 +724,6 @@ app.post("/api/parse-messy-file", async (req, res) => {
       const triggerIdx = headerRow.findIndex(h => h.includes("trigger") || h.includes("signal") || h.includes("news") || h.includes("pain") || h.includes("note"));
       const contactIdx = headerRow.findIndex(h => h.includes("contact") || h.includes("exec") || h.includes("person") || h.includes("owner"));
       const titleIdx = headerRow.findIndex(h => h.includes("title") || h.includes("role"));
-
       for (let i = 1; i < lines.length; i++) {
         const parts = lines[i].split(separator).map(p => p.trim());
         if (parts.length < 2) continue;
@@ -728,43 +750,33 @@ app.post("/api/parse-messy-file", async (req, res) => {
           else if (rawL.includes("moodle")) lmsId = "moodle";
           else if (rawL.includes("home") || rawL.includes("none")) lmsId = "homegrown_or_none";
         }
-
-        const trigSig = triggerIdx !== -1 && parts[triggerIdx] ? parts[triggerIdx] : "Evaluated during general annual digital tools update review cycle.";
-        const cName = contactIdx !== -1 && parts[contactIdx] ? parts[contactIdx] : "Associate Executive Director";
-        const cTitle = titleIdx !== -1 && parts[titleIdx] ? parts[titleIdx] : "LMS Operations Lead";
-
         parsed.push({
           id: `messy-csv-${Date.now()}-${i}`,
-          orgName: orgVal,
-          verticalId,
-          lmsId,
-          triggerSignal: trigSig,
-          contactName: cName,
-          contactTitle: cTitle,
-          confidence: 88,
-          status: "Target",
-          hasCredential: true,
-          fusionAngle: true
+          orgName: orgVal, verticalId, lmsId,
+          triggerSignal: triggerIdx !== -1 && parts[triggerIdx] ? parts[triggerIdx] : "Evaluated during general annual digital tools update review cycle.",
+          contactName: contactIdx !== -1 && parts[contactIdx] ? parts[contactIdx] : "Associate Executive Director",
+          contactTitle: titleIdx !== -1 && parts[titleIdx] ? parts[titleIdx] : "LMS Operations Lead",
+          confidence: 88, status: "Target", hasCredential: true, fusionAngle: true
         });
       }
     }
 
     if (parsed.length > 0) return parsed;
 
-    // Multi-line block extractor for clear text list (e.g. Org:, Vertical:, LMS:)
-    let currentBlock: any = {};
+    // Multi-line block extractor (Org: / Vertical: / LMS: style text)
+    let currentBlock: Partial<typeof parsed[0]> & {orgName?: string} = {};
     for (const l of lines) {
       const lower = l.toLowerCase();
       if (lower.startsWith("org:") || lower.startsWith("organization:") || lower.startsWith("association:") || lower.startsWith("company:")) {
         if (currentBlock.orgName) {
           parsed.push({
             id: `messy-block-${Date.now()}-${parsed.length}`,
-            confidence: 84,
-            status: "Target",
-            hasCredential: true,
-            fusionAngle: true,
+            confidence: 84, status: "Target", hasCredential: true, fusionAngle: true,
+            verticalId: "general_professional", lmsId: "unsure_research",
+            triggerSignal: "General digital evaluation initiative.",
+            contactName: "Director of Education", contactTitle: "Learning Technology Lead",
             ...currentBlock
-          });
+          } as typeof parsed[0]);
           currentBlock = {};
         }
         currentBlock.orgName = l.substring(l.indexOf(":") + 1).trim();
@@ -773,86 +785,68 @@ app.post("/api/parse-messy-file", async (req, res) => {
         let verticalId = "general_professional";
         if (vText.includes("health") || vText.includes("nurse") || vText.includes("med")) verticalId = "healthcare";
         else if (vText.includes("cpa") || vText.includes("finance") || vText.includes("tax")) verticalId = "cpa_finance";
-        else if (vText.includes("trade") || vText.includes("manuf") || vText.includes("construct")) verticalId = "trade_manufacturing";
+        else if (vText.includes("trade") || vText.includes("manuf")) verticalId = "trade_manufacturing";
         else if (vText.includes("board") || vText.includes("cred") || vText.includes("cert")) verticalId = "credentialing_board";
-        else if (vText.includes("ce") || vText.includes("prov")) verticalId = "ce_provider";
         currentBlock.verticalId = verticalId;
-      } else if (lower.startsWith("lms:") || lower.startsWith("platform:") || lower.startsWith("software:")) {
+      } else if (lower.startsWith("lms:") || lower.startsWith("platform:")) {
         const lText = l.substring(l.indexOf(":") + 1).trim().toLowerCase();
         let lmsId = "unsure_research";
         if (lText.includes("forj") || lText.includes("comm")) lmsId = "forj";
         else if (lText.includes("topclass") || lText.includes("wbt")) lmsId = "topclass";
         else if (lText.includes("docebo")) lmsId = "docebo";
-        else if (lText.includes("thought") || lText.includes("indust")) lmsId = "thought_industries";
-        else if (lText.includes("blue") || lText.includes("path")) lmsId = "blue_sky";
         else if (lText.includes("litmos")) lmsId = "litmos";
-        else if (lText.includes("crowd") || lText.includes("cadm")) lmsId = "crowd_wisdom";
         else if (lText.includes("moodle")) lmsId = "moodle";
-        else if (lText.includes("home") || lText.includes("none")) lmsId = "homegrown_or_none";
         currentBlock.lmsId = lmsId;
-      } else if (lower.startsWith("trigger:") || lower.startsWith("signal:") || lower.startsWith("pain:") || lower.startsWith("note:")) {
+      } else if (lower.startsWith("trigger:") || lower.startsWith("signal:") || lower.startsWith("note:")) {
         currentBlock.triggerSignal = l.substring(l.indexOf(":") + 1).trim();
-      } else if (lower.startsWith("contact:") || lower.startsWith("lead:") || lower.startsWith("person:") || lower.startsWith("owner:")) {
+      } else if (lower.startsWith("contact:") || lower.startsWith("exec:") || lower.startsWith("person:")) {
         currentBlock.contactName = l.substring(l.indexOf(":") + 1).trim();
       } else if (lower.startsWith("title:") || lower.startsWith("role:")) {
         currentBlock.contactTitle = l.substring(l.indexOf(":") + 1).trim();
       }
     }
-
     if (currentBlock.orgName) {
       parsed.push({
         id: `messy-block-${Date.now()}-${parsed.length}`,
-        confidence: 84,
-        status: "Target",
-        hasCredential: true,
-        fusionAngle: true,
-        ...currentBlock
+        confidence: 84, status: "Target", hasCredential: true, fusionAngle: true,
+        verticalId: currentBlock.verticalId || "general_professional",
+        lmsId: currentBlock.lmsId || "unsure_research",
+        triggerSignal: currentBlock.triggerSignal || "General digital evaluation initiative.",
+        contactName: currentBlock.contactName || "Director of Education",
+        contactTitle: currentBlock.contactTitle || "Learning Technology Lead",
+        orgName: currentBlock.orgName
       });
     }
 
-    // Absolutely raw paragraph layout parser (just pick some non-empty lines)
-    if (parsed.length === 0 && lines.length > 0) {
-      // Create a single row out of whatever we found
-      // We can take lines as target entities if they don't look like code/html
-      const candidateLines = lines.filter(line => line.length > 5 && !line.startsWith("<") && !line.startsWith("{"));
-      if (candidateLines.length > 0) {
-        parsed.push({
-          id: `messy-raw-${Date.now()}`,
-          orgName: candidateLines[0],
-          verticalId: "general_professional",
-          lmsId: "unsure_research",
-          triggerSignal: candidateLines.slice(1, 3).join(". ") || "Uncovered in raw document crawl.",
-          contactName: "Education Services Director",
-          contactTitle: "Training administrator",
-          confidence: 76,
-          status: "Target",
-          hasCredential: true,
-          fusionAngle: true
-        });
+    // Final fallback: treat each non-empty line as an org name
+    if (parsed.length === 0) {
+      for (let i = 0; i < Math.min(lines.length, 15); i++) {
+        const l = lines[i];
+        if (l.length > 3 && l.length < 120 && !l.startsWith("#") && !l.startsWith("//")) {
+          parsed.push({
+            id: `messy-line-${Date.now()}-${i}`,
+            orgName: l, verticalId: "general_professional", lmsId: "unsure_research",
+            triggerSignal: "Prospect identified via intelligent document scanning.",
+            contactName: "Director of Education", contactTitle: "Learning Technology Lead",
+            confidence: 70, status: "Target", hasCredential: true, fusionAngle: true
+          });
+        }
       }
     }
 
-    // Assure key mappings
-    return parsed.map(t => ({
-      ...t,
-      verticalId: t.verticalId || "general_professional",
-      lmsId: t.lmsId || "unsure_research",
-      triggerSignal: t.triggerSignal || "Outreach spark pending research validation.",
-      contactName: t.contactName || "CE Compliance Lead",
-      contactTitle: t.contactTitle || "Education Operations Manager"
-    }));
+    return parsed;
   };
 
-  if (!aiClient) {
-    console.log("No Gemini API Client for document parsing. Initiating client heuristics parser...");
+  if (!client) {
+    console.log("No Anthropic client for document parsing. Using heuristic parser.");
     return res.json({ success: true, targets: fallbackParse(), mode: "heuristic" });
   }
 
   try {
-    const prompt = `
+    const parsePrompt = `
 You are an advanced data extraction assistant specializing in outbound sales target identification.
-We have received messy content from a file uploaded by a user (it could be messy CSV, JSON, HTML, log files, or raw clipboard dumps).
-Please analyze and extract all target organizations/accounts from the content below.
+We have received messy content from a file uploaded by a user (could be CSV, JSON, HTML, log files, or raw text).
+Analyze and extract all target organizations from the content below.
 
 File Context / Content:
 """
@@ -860,151 +854,111 @@ ${contentToParse}
 """
 
 Guidelines:
-1. Extract and identify all target organizations/accounts. Extract as many distinct relevant entities as possible (up to 15 targets).
-2. For each extracted account, output:
+1. Extract and identify all target organizations (up to 15 targets).
+2. For each account output:
    - "orgName": Name of the organization, association, board, or society.
-   - "verticalId": Classification of vertical. It MUST be EXACTLY one of:
-     * "healthcare" (medical/nursing associations, healthcare societies, etc.)
-     * "cpa_finance" (CPA societies, financial associations, tax boards)
-     * "trade_manufacturing" (industrial, contracting, shipping, trade associations)
-     * "credentialing_board" (boards that certify people, license compliance)
-     * "ce_provider" (Continuing Education providers, course sellers)
-     * "general_professional" (any other general professional or standard association)
-   - "lmsId": Learning Management System ID. It MUST be EXACTLY one of:
-     * "forj" (Forj / CommPartners / Web Courseworks)
-     * "topclass" (TopClass / WBT Systems)
-     * "docebo" (Docebo)
-     * "thought_industries" (Thought Industries)
-     * "blue_sky" (Blue Sky eLearn / Path LMS)
-     * "litmos" (Litmos)
-     * "crowd_wisdom" (Crowd Wisdom / Cadmium)
-     * "moodle" (Moodle)
-     * "homegrown_or_none" (for custom-built proprietary software or no LMS listed)
-     * "unsure_research" (if we are completely unsure, we let the analyst search live)
-   - "triggerSignal": This is the outbound spark or event. If the source material only provides an LMS name or basic details, you should synthesize a highly realistic, extremely compelling outbound pain trigger tailored to that segment (e.g., "Critical database integration sync issues reported between membership system and legacy LMS", "Regulatory renewal updates forcing evaluations of reliable CE catalog engines", "Annual contract renewal cycle initiating with current vendor"). Be vivid, professional, and convincing of why they are a target!
-   - "contactName": Name or role of the contact person. If blank or unknown, use highly realistic default roles suited to the vertical (e.g., Jane Doe, or "Director of Education").
-   - "contactTitle": Title or role of the contact person or standard fallback (e.g., "Education Coordinator" or "Member Services Administrator").
-
-Return a standard compliant JSON array of these objects.
+   - "verticalId": EXACTLY one of: "healthcare" | "cpa_finance" | "trade_manufacturing" | "credentialing_board" | "ce_provider" | "general_professional"
+   - "lmsId": EXACTLY one of: "forj" | "topclass" | "docebo" | "thought_industries" | "blue_sky" | "litmos" | "crowd_wisdom" | "moodle" | "homegrown_or_none" | "unsure_research"
+   - "triggerSignal": Compelling outbound pain trigger tailored to this segment (synthesize if not provided).
+   - "contactName": Contact name or realistic default role.
+   - "contactTitle": Title or realistic default (e.g. "Education Coordinator").
 `;
 
-    const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              orgName: { type: Type.STRING },
-              verticalId: { type: Type.STRING },
-              lmsId: { type: Type.STRING },
-              triggerSignal: { type: Type.STRING },
-              contactName: { type: Type.STRING },
-              contactTitle: { type: Type.STRING }
-            },
-            required: ["orgName", "verticalId", "lmsId", "triggerSignal"]
+    const aiParsedData = await callClaudeStructured<{targets: {
+      orgName: string; verticalId: string; lmsId: string;
+      triggerSignal: string; contactName: string; contactTitle: string;
+    }[]}>(
+      client,
+      "claude-haiku-4-5-20251001",
+      "extract_targets",
+      "Extract target organizations from uploaded content into a structured list",
+      {
+        type: "object",
+        properties: {
+          targets: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                orgName: { type: "string" },
+                verticalId: { type: "string" },
+                lmsId: { type: "string" },
+                triggerSignal: { type: "string" },
+                contactName: { type: "string" },
+                contactTitle: { type: "string" }
+              },
+              required: ["orgName", "verticalId", "lmsId", "triggerSignal"]
+            }
           }
-        }
-      }
-    });
-
-    const text = response.text || "[]";
-    const parsed = JSON.parse(text.trim());
-
-    // Beautify the results with IDs and initial meta fields
-    const validated = parsed.map((item: any, idx: number) => {
-      const vertValid = ["healthcare", "cpa_finance", "trade_manufacturing", "credentialing_board", "ce_provider", "general_professional"].includes(item.verticalId)
-        ? item.verticalId
-        : "general_professional";
-      
-      const lmsValid = ["forj", "topclass", "docebo", "thought_industries", "blue_sky", "litmos", "crowd_wisdom", "moodle", "homegrown_or_none", "unsure_research"].includes(item.lmsId)
-        ? item.lmsId
-        : "unsure_research";
-
-      return {
-        id: `ai-parse-${Date.now()}-${idx}`,
-        orgName: item.orgName || `AI Scanned Org ${idx + 1}`,
-        verticalId: vertValid,
-        lmsId: lmsValid,
-        triggerSignal: item.triggerSignal || "Outbound evaluation request generated via intelligent document scanning.",
-        contactName: item.contactName || "Director of Continuing Education",
-        contactTitle: item.contactTitle || "Education Technology Lead",
-        confidence: Math.floor(Math.random() * 10) + 89,
-        lastUpdated: "Scanned via Dynamic Intelligence",
-        status: "Target",
-        hasCredential: true,
-        fusionAngle: true
-      };
-    });
-
-    return res.json({ success: true, targets: validated, mode: "genai" });
-
-  } catch (err) {
-    const isQuotaError = err && (
-      String(err).includes("RESOURCE_EXHAUSTED") ||
-      String(err).includes("quota") ||
-      String(err).includes("429")
+        },
+        required: ["targets"]
+      },
+      parsePrompt,
+      4096
     );
-    if (isQuotaError) {
-      console.log("Notice: Handled file parser API quota limit. Standard program rules active.");
-    } else {
-      console.log("Notice: Programmatic parsing fallback active for processed target.");
+
+    if (!aiParsedData || !Array.isArray(aiParsedData.targets) || aiParsedData.targets.length === 0) {
+      return res.json({ success: true, targets: fallbackParse(), mode: "heuristic_fallback" });
     }
-    return res.json({ success: true, targets: fallbackParse(), mode: "heuristic", isQuotaExceeded: !!isQuotaError });
+
+    const validVerticals = ["healthcare", "cpa_finance", "trade_manufacturing", "credentialing_board", "ce_provider", "general_professional"];
+    const validLms = ["forj", "topclass", "docebo", "thought_industries", "blue_sky", "litmos", "crowd_wisdom", "moodle", "homegrown_or_none", "unsure_research"];
+
+    const validated = aiParsedData.targets.map((item, idx) => ({
+      id: `ai-parse-${Date.now()}-${idx}`,
+      orgName: item.orgName || `AI Scanned Org ${idx + 1}`,
+      verticalId: validVerticals.includes(item.verticalId) ? item.verticalId : "general_professional",
+      lmsId: validLms.includes(item.lmsId) ? item.lmsId : "unsure_research",
+      triggerSignal: item.triggerSignal || "Outbound evaluation request generated via intelligent document scanning.",
+      contactName: item.contactName || "Director of Continuing Education",
+      contactTitle: item.contactTitle || "Education Technology Lead",
+      confidence: Math.floor(Math.random() * 10) + 89,
+      lastUpdated: "Scanned via Claude Intelligence",
+      status: "Target",
+      hasCredential: true,
+      fusionAngle: true
+    }));
+
+    const isQuotaExceeded = false;
+    return res.json({ success: true, targets: validated, mode: "claude", isQuotaExceeded });
+
+  } catch (error) {
+    const isQuotaError = error instanceof Anthropic.RateLimitError ||
+      (error && String(error).includes("429"));
+    console.warn("Claude parse fallback triggered. Using heuristic parser.");
+    return res.json({
+      success: true,
+      targets: fallbackParse(),
+      mode: "heuristic_fallback",
+      isQuotaExceeded: !!isQuotaError
+    });
   }
 });
 
-// API endpoint to generate the email
+// ──────────────────────────────────────────────────────────────────────────────
+// POST /api/generate-outreach — generate personalized cold email via Claude
+// ──────────────────────────────────────────────────────────────────────────────
 app.post("/api/generate-outreach", async (req, res) => {
-  const aiClient = getGenAIClient();
+  const client = getClient();
   const {
-    orgName,
-    verticalId,
-    verticalDisplay,
-    lmsId,
-    lmsDisplay,
-    painPointId,
-    painPointUserVoice,
-    hasCredential,
-    fusionAngle,
-    includeKeywords,
-    excludeKeywords,
-    readingLevel,
-    tone,
-    triggerSignal,
-    scrapedNews,
-    scrapedExplanation,
+    orgName, verticalId, verticalDisplay, lmsId, lmsDisplay,
+    painPointId, painPointUserVoice, hasCredential, fusionAngle,
+    includeKeywords, excludeKeywords, readingLevel, tone,
+    triggerSignal, scrapedNews, scrapedExplanation,
   } = req.body;
 
   if (!orgName || !verticalDisplay || !lmsDisplay || !painPointUserVoice) {
     return res.status(400).json({ error: "Missing required fields." });
   }
 
-  // If no AI client, fall back instantly
-  if (!aiClient) {
-    console.log("No Gemini AI Client. Returning fallback outreach template.");
+  if (!client) {
+    console.log("No Anthropic client. Returning fallback outreach template.");
     const fallback = generateFallbackEmail(
-      orgName,
-      verticalDisplay,
-      lmsDisplay,
-      painPointUserVoice,
-      !!hasCredential,
-      !!fusionAngle,
-      includeKeywords,
-      excludeKeywords,
-      readingLevel,
-      tone,
-      triggerSignal,
-      scrapedNews
+      orgName, verticalDisplay, lmsDisplay, painPointUserVoice,
+      !!hasCredential, !!fusionAngle, includeKeywords, excludeKeywords,
+      readingLevel, tone, triggerSignal, scrapedNews
     );
-    return res.json({
-      success: true,
-      mode: "template",
-      ...fallback
-    });
+    return res.json({ success: true, mode: "template", ...fallback });
   }
 
   try {
@@ -1016,147 +970,110 @@ app.post("/api/generate-outreach", async (req, res) => {
       ? "Do NOT over-use contractions. Use them sparingly to maintain a refined professional tone."
       : "Use contractions like \"we're\", \"you're\", \"it's\" frequently to sound casual and friendly.";
 
-    const excludeBlock = excludeKeywords 
-      ? `In addition to the previous list, you MUST strictly avoid these user-defined keywords/phrases completely: "${excludeKeywords}".`
+    const excludeBlock = excludeKeywords
+      ? `In addition to the previous list, STRICTLY avoid these user-defined keywords/phrases: "${excludeKeywords}".`
       : "";
 
     const includeBlock = includeKeywords
-      ? `- You MUST naturally weave reference or ideas around these specific user-defined terms/phrases into the text: "${includeKeywords}". Do not force them awkwardly; they should blend nicely and sound authentic like safe selling.`
+      ? `- MUST naturally weave these user-defined terms into the text: "${includeKeywords}". Blend naturally.`
       : "";
 
     let scrapedNewsBlock = "";
     if (scrapedNews && Array.isArray(scrapedNews) && scrapedNews.length > 0) {
-      const newsLines = scrapedNews.map((n: any) => `- Headline: "${n.headline}", Context: "${n.snippet}"`).join("\n");
+      const newsLines = scrapedNews
+        .map((n: {headline: string; snippet: string}) => `- Headline: "${n.headline}", Context: "${n.snippet}"`)
+        .join("\n");
       scrapedNewsBlock = `
 
-We have successfully scraped these real-time professional learning updates and continuing education announcements from ${orgName}'s public web domain:
+We scraped these real-time learning updates from ${orgName}'s public web:
 ${newsLines}
 
-STRICT WRITING RULES FOR COLD OUTREACH:
-1. You MUST weave in reference to ONE of these live learning/continuing education updates or training activities in your draft (either as the opening context or as a supporting reason for reaching out).
-2. DO NOT write or paste the exact news headlines or snippet descriptions word-for-word! Doing so makes the outreach sound like a copy-paste robot. Instead, digest and rephrase it naturally (e.g. rephrase "clinical nursing training program" to "your nursing training updates" or "tax-advisory micro-credential curricula" to "your tax micro-credentials").
-3. DO NOT list multiple news items. Just speak to a single relevant theme or development.
-4. DO NOT output bullet points of news or raw JSON structures inside the email draft. Keep the email body clean and flowy.`;
+STRICT RULES:
+1. Weave in ONE of these updates naturally (rephrase, do NOT paste verbatim).
+2. Do NOT list multiple news items.
+3. Do NOT output bullet points or JSON inside the email.`;
     }
 
-    let promptTargetDetails = `Target prospect: ${orgName}, a ${verticalDisplay} currently using the LMS "${lmsDisplay}".
-${triggerSignal ? `We have identified this key outbound Trigger Signal or recent change: "${triggerSignal}".` : `The primary pain point they are facing is: "${painPointUserVoice}".`}${scrapedNewsBlock}`;
-
+    let promptTargetDetails: string;
     if (lmsId === "unsure_research") {
-      promptTargetDetails = `Target prospect: ${orgName}, a ${verticalDisplay}. The competitor LMS is unconfirmed or we are prioritizing their transition trigger.
-${triggerSignal 
-  ? `Key outbound Trigger Signal: "${triggerSignal}". Write the outreach focused heavily on this transition. Refer to their learning system generally as "your current training system", "current portal", "learning tools" or "legacy LMS" — DO NOT assume or name a specific competitor brand.` 
-  : `The primary pain point they are facing is: "${painPointUserVoice}". Refer to their LMS generally as "your current training catalog" or "learning system" without guessing a brand name.`}${scrapedNewsBlock}`;
+      promptTargetDetails = `Target: ${orgName}, a ${verticalDisplay}. LMS is unconfirmed.
+${triggerSignal
+  ? `Key Trigger Signal: "${triggerSignal}". Focus outreach on this. Refer to their system as "your current training system", "current portal", or "legacy LMS" — do NOT guess a brand name.`
+  : `Pain point: "${painPointUserVoice}". Refer to LMS as "your current training catalog" or "learning system".`}${scrapedNewsBlock}`;
+    } else {
+      promptTargetDetails = `Target: ${orgName}, a ${verticalDisplay} using the LMS "${lmsDisplay}".
+${triggerSignal ? `Outbound Trigger Signal: "${triggerSignal}".` : `Pain point: "${painPointUserVoice}".`}${scrapedNewsBlock}`;
     }
 
     const prompt = `
 Write a cold sales email for Pat, a friendly D2L sales rep.
 ${promptTargetDetails}
 
-Follow these strict constraints:
-- Target length: 60 to 90 words. You MUST be extremely brief.
+Strict constraints:
+- Length: 60 to 90 words. Be extremely brief.
 - Tone: ${toneDescription}
-- Reading grade level: Write for a ${readingLevel || 6}th-grade reading level. Use vocabulary that corresponds to this readability standard.
+- Reading level: ${readingLevel || 6}th grade.
 - Contractions: ${contractionRule}
-- Never use these banned words: "leverage", "solution", "robust", "seamless", "empower", "unlock", "ecosystem", "journey", "partner with you", "synergy", "best-in-class", "cutting-edge", "circle back", "touch base", "hope this email finds you well", "I noticed you're using", "quick question", "just checking in". ${excludeBlock}
+- Never use: "leverage", "solution", "robust", "seamless", "empower", "unlock", "ecosystem", "journey", "partner with you", "synergy", "best-in-class", "cutting-edge", "circle back", "touch base", "hope this email finds you well", "I noticed you're using", "quick question", "just checking in". ${excludeBlock}
 ${includeBlock}
-- Opening line (adjusted slightly for tone profile):
-  ${scrapedNews && Array.isArray(scrapedNews) && scrapedNews.length > 0
-    ? `Incorporate and rephrase one of the scraped news items naturally. E.g., "Saw your new updates regarding the [topic]..." or "With your new [topic] initiative, I was curious..." (DO NOT output literal brackets "[]" or placeholder text! Replace them with the actual scraped news context).`
-    : triggerSignal 
-      ? `Reference or touch upon the Trigger Signal ("${triggerSignal}") naturally. E.g. "We saw you're transitioning..." or "Saw your shift towards..."`
-      : `Choose one of these structures:
-         * "Saw [something specific about ${orgName}'s courses or profile] — got me thinking about [how it affects learners or staff]." (Replace the brackets with actual content, never output literal bracket chars!)
-         * "Question for you: [an open-ended question that touches on the pain point: '${painPointUserVoice}']." (Replace the brackets with the actual question, never output literal bracket chars!)
-         * "A few peers in the ${verticalDisplay.toLowerCase()} space mentioned [this common problem] — figured you might be running into the exact same." (Replace the brackets with actual content, never output literal bracket chars!)`}
-- Never output literal brackets like "[" or "]" with placeholder text inside. Any bracketed placeholder must be fully replaced with actual polished copy.
-- No more than 1 question in the entire email.
-- Do NOT use bullet points in the email body.
-- Call to Action: Put a soft CTA like "Worth a quick chat?" or "Open to comparing notes?". If the tone profile is formal, you may use equivalent professional phrases like "Would you be open to a brief conversation?" or "Open to comparing notes?". Keep it extremely low pressure.
-- Sign off: Must end with "Pat" (or a professional variant like "Best regards,\nPat" if formal).
-- Subject Line: Provide a subject line under 6 words starting with "Subject: ". Use lowercase or sentence case. NO colons. E.g. "easy for members to find courses?" or "clunky certification workflows?".
-
-Respond with a JSON object in this format:
-{
-  "subject": "your subject line",
-  "body": "your cold email body"
-}
-Do not write any markdown wrappers around the JSON. Return only the raw JSON.
+- Opening: ${scrapedNews && Array.isArray(scrapedNews) && scrapedNews.length > 0
+  ? "Rephrase one scraped news item naturally as context for reaching out."
+  : triggerSignal
+    ? `Reference the trigger signal ("${triggerSignal}") naturally.`
+    : `One of: "Saw [something specific about ${orgName}] — got me thinking about [pain]." OR "Question for you: [open-ended pain question]." OR "A peer in ${verticalDisplay.toLowerCase()} mentioned [common problem]."`}
+- Never output literal brackets like "[" or "]".
+- Max 1 question in the entire email.
+- No bullet points.
+- CTA: soft close like "Worth a quick chat?" or professional equivalent.
+- Sign off: Must end with "Pat" (or "Best regards,\nPat" if formal).
+- Subject: under 6 words, lowercase or sentence case, no colons.
 `;
 
-    const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: "OBJECT",
-          properties: {
-            subject: { type: "STRING" },
-            body: { type: "STRING" }
-          },
-          required: ["subject", "body"]
-        }
-      }
-    });
+    const parsed = await callClaudeStructured<{ subject: string; body: string }>(
+      client,
+      "claude-haiku-4-5-20251001",
+      "write_email",
+      "Write a cold outreach email following the given constraints exactly",
+      {
+        type: "object",
+        properties: {
+          subject: { type: "string", description: "Subject line under 6 words, no colons" },
+          body: { type: "string", description: "Email body, 60-90 words" }
+        },
+        required: ["subject", "body"]
+      },
+      prompt,
+      1024
+    );
 
-    const responseText = response.text || "";
-    const parsed = JSON.parse(responseText.trim());
+    if (!parsed) throw new Error("Claude returned no structured output.");
 
-    // Post-generation validation & safety sanitization
-    let bodyFormatted = parsed.body || "";
-    bodyFormatted = sanitizeEmailBody(bodyFormatted, verticalDisplay, tone);
+    let bodyFormatted = sanitizeEmailBody(parsed.body || "", verticalDisplay, tone);
+    let subjectFormatted = (parsed.subject || "").replace(/:/g, "").replace(/subject/gi, "").trim();
 
-    let subjectFormatted = parsed.subject || "";
-    // strip out colons
-    subjectFormatted = subjectFormatted.replace(/:/g, "").replace(/subject/gi, "").trim();
-
-    // Word count safety check
     const wordCount = bodyFormatted.split(/\s+/).filter(Boolean).length;
-    console.log(`Gemini outreach email generated. Subject: "${subjectFormatted}". Word count: ${wordCount}`);
+    console.log(`Claude email generated. Subject: "${subjectFormatted}". Words: ${wordCount}`);
 
-    // If fusion angle is enabled, append the P.S. block cleanly
     if (fusionAngle) {
       if (tone === "formal") {
-        const psBlock = `\n\nP.S. — D2L is hosting our annual Fusion Conference in Phoenix, July 8-10. Many ${verticalDisplay.toLowerCase()} leaders will be in attendance. Let me know if you plan to attend.`;
-        if (!bodyFormatted.toLowerCase().includes("phoenix")) {
-          bodyFormatted = bodyFormatted.trim() + psBlock;
-        }
+        const ps = `\n\nP.S. — D2L is hosting our annual Fusion Conference in Phoenix, July 8-10. Many ${verticalDisplay.toLowerCase()} leaders will be in attendance. Let me know if you plan to attend.`;
+        if (!bodyFormatted.toLowerCase().includes("phoenix")) bodyFormatted = bodyFormatted.trim() + ps;
       } else {
-        const psBlock = `\n\nP.S. — we're hosting Fusion in Phoenix July 8-10, lot of ${verticalDisplay.toLowerCase()} folks will be there. Worth grabbing 15 min if you're going?`;
-        if (!bodyFormatted.toLowerCase().includes("phoenix")) {
-          bodyFormatted = bodyFormatted.trim() + psBlock;
-        }
+        const ps = `\n\nP.S. — we're hosting Fusion in Phoenix July 8-10, lot of ${verticalDisplay.toLowerCase()} folks will be there. Worth grabbing 15 min if you're going?`;
+        if (!bodyFormatted.toLowerCase().includes("phoenix")) bodyFormatted = bodyFormatted.trim() + ps;
       }
     }
 
-    return res.json({
-      success: true,
-      mode: "genai",
-      subject: subjectFormatted,
-      body: bodyFormatted
-    });
+    return res.json({ success: true, mode: "claude", subject: subjectFormatted, body: bodyFormatted });
 
   } catch (error) {
-    console.warn("Outreach email generation fell back to high-quality template (API Limit/Offline is expected).");
-    const isQuotaError = error && (
-      String(error).includes("RESOURCE_EXHAUSTED") ||
-      String(error).includes("quota") ||
-      String(error).includes("429")
-    );
+    const isQuotaError = error instanceof Anthropic.RateLimitError ||
+      (error && String(error).includes("429"));
+    console.warn("Outreach generation fell back to template. API limit or offline.");
     const fallback = generateFallbackEmail(
-      orgName,
-      verticalDisplay,
-      lmsDisplay,
-      painPointUserVoice,
-      !!hasCredential,
-      !!fusionAngle,
-      includeKeywords,
-      excludeKeywords,
-      readingLevel,
-      tone,
-      triggerSignal,
-      scrapedNews
+      orgName, verticalDisplay, lmsDisplay, painPointUserVoice,
+      !!hasCredential, !!fusionAngle, includeKeywords, excludeKeywords,
+      readingLevel, tone, triggerSignal, scrapedNews
     );
     return res.json({
       success: true,
@@ -1169,8 +1086,62 @@ Do not write any markdown wrappers around the JSON. Return only the raw JSON.
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Email artifact endpoints — adapted from HtmlPublishingAgent (Agents repo)
+// Provides create/publish/list/retrieve semantics for generated outreach emails
+// ──────────────────────────────────────────────────────────────────────────────
+
+// POST /api/publish-email — save a generated email as a self-contained HTML artifact
+app.post("/api/publish-email", (req, res) => {
+  const { orgName, subject, body, verticalId, lmsId } = req.body;
+  if (!orgName || !subject || !body) {
+    return res.status(400).json({ error: "orgName, subject, and body are required." });
+  }
+  try {
+    const id = artifactSlug(orgName);
+    const now = new Date().toISOString();
+    const existing = emailArtifactStore.get(id);
+    const html = renderEmailHtml(orgName, subject, body);
+    const artifact: EmailArtifact = {
+      id, orgName, subject, body, html,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      verticalId,
+      lmsId,
+    };
+    emailArtifactStore.set(id, artifact);
+    console.log(`[Artifact] Published email for "${orgName}" (id: ${id})`);
+    return res.json({
+      success: true,
+      artifact: { id, orgName, subject, createdAt: artifact.createdAt, updatedAt: artifact.updatedAt }
+    });
+  } catch (err) {
+    return res.status(400).json({ error: String(err) });
+  }
+});
+
+// GET /api/email-artifacts — list all saved email artifacts
+app.get("/api/email-artifacts", (_req, res) => {
+  const artifacts = [...emailArtifactStore.values()]
+    .map(a => ({ id: a.id, orgName: a.orgName, subject: a.subject,
+      createdAt: a.createdAt, updatedAt: a.updatedAt, verticalId: a.verticalId, lmsId: a.lmsId }))
+    .sort((a, b) => a.orgName.localeCompare(b.orgName));
+  return res.json({ success: true, artifacts, total: artifacts.length });
+});
+
+// GET /api/email-artifacts/:id — retrieve full artifact including HTML
+app.get("/api/email-artifacts/:id", (req, res) => {
+  const artifact = emailArtifactStore.get(req.params.id);
+  if (!artifact) {
+    return res.status(404).json({ error: `Email artifact not found: ${req.params.id}` });
+  }
+  return res.json({ success: true, artifact });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Server startup — identical to original
+// ──────────────────────────────────────────────────────────────────────────────
 async function startServer() {
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -1178,13 +1149,12 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
     });
   }
-
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });

@@ -1,6 +1,6 @@
 {
-  "name": "Displacement Angle Finder",
-  "description": "A trigger-based sales sidekick for D2L AEs that ingests prospect spreadsheets and extracts real-time competitor displacement signals into a high-converting email outreach kit.",
+  "name": "Displacement Angle Finder — Claude Code Edition",
+  "description": "A trigger-based sales sidekick for D2L AEs rebuilt with Anthropic Claude. Ingests prospect spreadsheets, detects competitor LMS via Claude web search, and generates hyper-personalized outreach emails. Includes cloud-native email artifact management adapted from the Agents repo HtmlPublishingAgent.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_CLAUDE_API", "MAJOR_CAPABILITY_WEB_SEARCH", "MAJOR_CAPABILITY_EMAIL_ARTIFACTS"]
 }
