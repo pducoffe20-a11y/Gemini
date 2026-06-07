@@ -102,7 +102,6 @@ export default function App() {
     detectedName: string | null;
     confidence: number;
     explanation: string;
-    hasLiveResearch?: boolean;
     sources?: { title: string; uri: string }[];
     learningNews?: { headline: string; snippet: string; date?: string }[];
   } | null>(null);
@@ -279,7 +278,6 @@ export default function App() {
           detectedName: data.detectedName,
           confidence: data.confidence,
           explanation: data.explanation,
-          hasLiveResearch: data.hasLiveResearch,
           sources: data.sources,
           learningNews: data.learningNews
         });
@@ -294,16 +292,9 @@ export default function App() {
     }
   };
 
-  // Reset research result when organization name or target changes
+  // Reset research result when organization name or target changes, prompting user to click real-time search manually
   useEffect(() => {
     setResearchResult(null);
-  }, [debouncedOrgName, selectedLMS]);
-
-  // Auto-trigger live research whenever org name settles and LMS is unknown
-  useEffect(() => {
-    if (selectedLMS === "unsure_research" && debouncedOrgName) {
-      triggerLmsResearch(false);
-    }
   }, [debouncedOrgName, selectedLMS]);
 
   // Story matching logic based on selected vertical/compliance state
@@ -859,17 +850,10 @@ export default function App() {
             </span>
           </div>
 
-          {researchingLms ? (
-            <div className="flex items-center gap-2 bg-indigo-50 border border-indigo-200 px-3.5 py-2 rounded-lg text-indigo-700 font-semibold text-xs animate-pulse">
-              <span className="w-2.5 h-2.5 rounded-full bg-indigo-500 animate-ping"></span>
-              AI Researching...
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 bg-brand/5 border border-brand/20 px-3.5 py-2 rounded-lg text-brand font-semibold text-xs">
-              <span className="w-2.5 h-2.5 rounded-full bg-brand"></span>
-              Tracker Active
-            </div>
-          )}
+          <div className="flex items-center gap-2 bg-brand/5 border border-brand/20 px-3.5 py-2 rounded-lg text-brand font-semibold text-xs animate-pulse">
+            <span className="w-2.5 h-2.5 rounded-full bg-brand"></span>
+            Real-time Tracker Desk Live
+          </div>
         </div>
       </header>
 
@@ -1083,7 +1067,7 @@ export default function App() {
                             isSelected ? "bg-brand/10 hover:bg-brand/15 font-semibold" : ""
                           }`}
                         >
-                          <td className="py-3 px-4 font-semibold text-slate-900">
+                          <td className="py-3 px-4 font-semibold text-slate-905">
                             <div className="flex items-center gap-2">
                               {isSelected ? (
                                 <CheckCircle2 className="w-4 h-4 text-brand shrink-0" />
@@ -1163,7 +1147,7 @@ export default function App() {
           <div className="lg:col-span-5 flex flex-col gap-6 h-full">
             
             {/* Target Details Workspace Card */}
-            <div id="target-details-card" className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm flex flex-col relative group overflow-hidden">
+            <div id="target-details-card" className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm flex flex-col relative relative group overflow-hidden">
               <div className="flex justify-between items-center mb-4 pb-2 border-b border-slate-100">
                 <h2 className="text-sm font-bold font-display uppercase text-slate-900 flex items-center gap-2">
                   <span className="w-2.5 h-2.5 bg-brand rounded-full animate-pulse"></span>
@@ -1200,7 +1184,7 @@ export default function App() {
                       <select
                         value={selectedVertical}
                         onChange={(e) => updateTargetField("verticalId", e.target.value)}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-900 font-bold"
+                        className="w-full bg-slate-50 border border-slate-205 rounded-lg px-3 py-1.5 text-xs text-slate-900 font-bold"
                       >
                         {verticals.map((v) => (
                           <option key={v.id} value={v.id}>{v.display}</option>
@@ -1239,31 +1223,31 @@ export default function App() {
                   {selectedLMS === "unsure_research" && (
                     <div className="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl p-3.5 space-y-2.5 shadow-sm transform transition duration-300">
                       <div className="flex items-center justify-between">
-                        <span className="text-[10px] font-bold text-indigo-700 tracking-wider uppercase flex items-center gap-1.5">
-                          <Sparkles className="w-3.5 h-3.5 text-indigo-500" />
-                          AI Web Research
+                        <span className="text-[10px] font-bold text-blue-750 tracking-wider uppercase flex items-center gap-1">
+                          <Sparkles className="w-3.5 h-3.5 animate-pulse text-indigo-600" />
+                          AI Real-Time Scraper Engine
                         </span>
                         {researchingLms ? (
-                          <span className="text-[10px] font-medium text-indigo-600 flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-indigo-500 animate-ping" />
-                            Searching live...
+                          <span className="text-[10px] font-medium text-indigo-600 flex items-center gap-1">
+                            <span className="w-2 h-2 rounded-full bg-indigo-600 animate-ping" />
+                            Scraping Web in Real-Time...
                           </span>
                         ) : (
                           <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => triggerLmsResearch(true)}
-                              className="text-[9.5px] bg-indigo-100 hover:bg-indigo-200 text-indigo-700 font-bold px-2 py-0.5 rounded transition cursor-pointer"
-                              title="Force a fresh web search"
-                            >
-                              {researchResult ? "Re-Search" : "Search Now"}
-                            </button>
                             {researchResult && (
-                              <span className="text-[9px] bg-emerald-100 text-emerald-700 font-bold px-1.5 py-0.5 rounded-full flex items-center gap-1">
-                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                                Done
-                              </span>
+                              <button
+                                type="button"
+                                onClick={() => triggerLmsResearch(true)}
+                                className="text-[9.5px] bg-indigo-100 hover:bg-indigo-200 text-indigo-700 font-bold px-2 py-0.5 rounded transition cursor-pointer"
+                                title="Force fresh AI Web scraping"
+                              >
+                                Re-Scrape
+                              </button>
                             )}
+                            <span className="text-[9px] bg-indigo-100 text-indigo-850 font-bold px-1.5 py-0.5 rounded-full flex items-center gap-1">
+                              <span className="w-1.5 h-1.5 rounded-full bg-indigo-600"></span>
+                              Scraper Ready
+                            </span>
                           </div>
                         )}
                       </div>
@@ -1276,7 +1260,7 @@ export default function App() {
                       ) : researchResult ? (
                         <div className="space-y-3.5">
                           <div className="bg-white/80 rounded-lg p-2.5 border border-blue-105 shadow-2xs">
-                            <p className="text-xs text-slate-700 leading-relaxed font-semibold">
+                            <p className="text-xs text-slate-705 leading-relaxed font-semibold">
                               {researchResult.explanation}
                             </p>
                           </div>
@@ -1302,44 +1286,28 @@ export default function App() {
                             </div>
                           )}
 
-                          {/* Learning News & CE Context */}
-                          {researchResult.learningNews && researchResult.learningNews.length > 0 && researchResult.learningNews[0].headline !== "No relevant information available" && (
+                          {/* Live Continuing Education & Learning News */}
+                          {researchResult.learningNews && researchResult.learningNews.length > 0 && (
                             <div className="pt-2.5 border-t border-blue-100 space-y-1.5">
-                              <div className="flex items-center justify-between">
-                                <span className="text-[9.5px] font-bold uppercase tracking-wider flex items-center gap-1 text-emerald-800">
-                                  {researchResult.hasLiveResearch ? (
-                                    <>
-                                      <span className="flex h-2 w-2 relative">
-                                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                                        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                                      </span>
-                                      Live Web Context:
-                                    </>
-                                  ) : (
-                                    <>
-                                      <span className="h-2 w-2 rounded-full bg-amber-400 inline-block"></span>
-                                      AI-Synthesized Context:
-                                    </>
-                                  )}
+                              <span className="text-[9.5px]/[13px] font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1 text-emerald-800">
+                                <span className="flex h-2 w-2 relative">
+                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                                 </span>
-                                {!researchResult.hasLiveResearch && (
-                                  <span className="text-[8px] bg-amber-50 text-amber-700 border border-amber-200 font-bold px-1.5 py-0.5 rounded-full">
-                                    AI Generated
-                                  </span>
-                                )}
-                              </div>
+                                📡 Scraped Learning & Continuing Ed News:
+                              </span>
                               <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
                                 {researchResult.learningNews.map((news, i) => (
                                   <div
                                     key={i}
-                                    className={`border rounded-md p-2 transition-colors ${researchResult.hasLiveResearch ? "bg-emerald-50/50 hover:bg-emerald-50 border-emerald-200/40" : "bg-amber-50/40 hover:bg-amber-50/80 border-amber-200/40"}`}
+                                    className="bg-emerald-50/45 hover:bg-emerald-50 border border-emerald-125/25 rounded-md p-2 transition duration-155"
                                   >
                                     <div className="flex items-start justify-between gap-1.5 mb-1">
                                       <h4 className="text-[10px] font-bold text-slate-800 leading-snug">
                                         {news.headline}
                                       </h4>
                                       {news.date && (
-                                        <span className="text-[7.5px] bg-slate-100 text-slate-600 font-bold px-1.5 py-0.5 rounded-full whitespace-nowrap">
+                                        <span className="text-[7.5px] bg-emerald-100/70 text-emerald-850 font-bold px-1.5 py-0.5 rounded-full whitespace-nowrap">
                                           {news.date}
                                         </span>
                                       )}
@@ -1350,13 +1318,6 @@ export default function App() {
                                   </div>
                                 ))}
                               </div>
-                            </div>
-                          )}
-                          {researchResult.learningNews && researchResult.learningNews[0]?.headline === "No relevant information available" && (
-                            <div className="pt-2.5 border-t border-blue-100">
-                              <p className="text-[10px] text-slate-500 bg-slate-50 rounded-lg p-2 border border-slate-200">
-                                No public CE or training footprint found for this organization. Email will be built from the trigger signal and vertical context.
-                              </p>
                             </div>
                           )}
 
@@ -1385,17 +1346,17 @@ export default function App() {
                           )}
                         </div>
                       ) : (
-                        <div className="py-2 px-3 bg-white/80 border border-blue-100 rounded-xl space-y-2.5 flex flex-col items-center text-center">
-                          <p className="text-[11px] text-slate-600 leading-relaxed">
-                            Searches the web for <strong className="text-indigo-800">"{orgName}"</strong> — detects their LMS, finds recent CE activity, and surfaces real trigger context for your email.
+                        <div className="py-2 px-3 bg-white/80 border border-blue-105 rounded-xl space-y-2.5 flex flex-col items-center text-center">
+                          <p className="text-[11px] text-slate-600 leading-relaxed max-w-sm">
+                            Scrapes digital tech directories, subdomains, and search archives matching <strong className="text-indigo-900 font-bold">"{orgName}"</strong> in real-time.
                           </p>
                           <button
                             type="button"
                             onClick={() => triggerLmsResearch(true)}
-                            className="w-full bg-gradient-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-700 text-white font-bold text-[11px] px-3.5 py-2 rounded-lg transition shadow-sm flex items-center justify-center gap-1.5 cursor-pointer"
+                            className="w-full bg-linear-to-r from-indigo-600 to-blue-600 hover:from-indigo-700 hover:to-blue-750 text-white font-extrabold text-[11px] px-3.5 py-2 rounded-lg transition duration-155 shadow-sm flex items-center justify-center gap-1.5 cursor-pointer"
                           >
                             <Search className="w-3.5 h-3.5" />
-                            Search Web Now
+                            Launch Real-Time AI Scraper
                           </button>
                         </div>
                       )}
@@ -1411,7 +1372,7 @@ export default function App() {
                         value={contactName}
                         onChange={(e) => updateTargetField("contactName", e.target.value)}
                         placeholder="N/A"
-                        className="w-full bg-slate-50 border border-slate-200 rounded pl-2 pr-2 py-1 text-xs text-slate-800"
+                        className="w-full bg-slate-50 border border-slate-180 rounded pl-2 pr-2 py-1 text-xs text-slate-800"
                       />
                     </div>
                     <div>
@@ -1421,7 +1382,7 @@ export default function App() {
                         value={contactTitle}
                         onChange={(e) => updateTargetField("contactTitle", e.target.value)}
                         placeholder="N/A"
-                        className="w-full bg-slate-50 border border-slate-200 rounded pl-2 pr-2 py-1 text-xs text-slate-800"
+                        className="w-full bg-slate-50 border border-slate-180 rounded pl-2 pr-2 py-1 text-xs text-slate-800"
                       />
                     </div>
                   </div>
@@ -1544,7 +1505,7 @@ export default function App() {
                     max="12"
                     value={readingLevel}
                     onChange={(e) => setReadingLevel(parseInt(e.target.value))}
-                    className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-brand"
+                    className="w-full h-1.5 bg-slate-150 rounded-lg appearance-none cursor-pointer accent-brand"
                   />
                   <div className="flex justify-between text-[9px] text-slate-400 font-semibold px-0.5 mt-1">
                     <span>5th Grade</span>
@@ -1810,7 +1771,7 @@ export default function App() {
               
               {isGenerating && generationMode === "loading" ? (
                 <div className="py-28 flex-1 flex flex-col items-center justify-center gap-3">
-                  <div className="w-9 h-9 rounded-full border-[3px] border-white/10 border-t-brand animate-spin"></div>
+                  <div className="w-9 h-9 rounded-full border-3 border-white/10 border-t-brand animate-spin"></div>
                   <p className="text-xs text-slate-400 font-bold font-mono tracking-wider animate-pulse">
                     Synthesizing Outbound Messaging...
                   </p>
