@@ -425,7 +425,7 @@ app.post("/api/research-lms", async (req, res) => {
     try {
       console.log(`[Research Log] Initiating live web-search lookup for target: "${orgName}"`);
       const searchRes = await aiClient.models.generateContent({
-        model: "gemini-3.5-flash",
+        model: "gemini-2.0-flash",
         contents: `Determine the dynamic continuing education footprint for "${orgName}" by searching the web. Specifically focus on finding:
 1. What exact Learning Management System (LMS) or CE software platform they run (e.g. Forj/CommPartners, TopClass, Docebo, Litmos, Thought Industries, Path LMS / Blue Sky, Crowd Wisdom, or Moodle).
 2. The latest real professional training seminars, course catalog developments, active credit certificate changes, or online learning updates for "${orgName}".`,
@@ -491,7 +491,7 @@ You must return EXACTLY this JSON structure:
 `;
 
     const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.0-flash",
       contents: searchPrompt,
       config: {
         responseMimeType: "application/json",
@@ -523,12 +523,12 @@ You must return EXACTLY this JSON structure:
     const textInput = response.text || "{}";
     const data = JSON.parse(textInput.trim());
 
-    // Use ONLY authentic google search grounding chunks. If no live web search matches were found, sources is empty.
+    // Grounding sources from live Google Search (may be empty even on successful search)
     const finalSources = activeSources;
+    const hasLiveResearch = finalSources.length > 0;
 
-    // If active sources is empty, or the generated news collection is empty, display the "No relevant information available" outcome
-    const hasGenuineResearch = finalSources.length > 0;
-    const finalNews = (hasGenuineResearch && Array.isArray(data.learningNews) && data.learningNews.length > 0)
+    // Show AI-analyzed news regardless of whether grounding chunks were returned
+    const finalNews = (Array.isArray(data.learningNews) && data.learningNews.length > 0)
       ? data.learningNews
       : noResearchFoundNews;
 
@@ -536,9 +536,10 @@ You must return EXACTLY this JSON structure:
       detectedLms: detectedLms !== "unsure_research" ? detectedLms : (data.detectedLms || "unsure_research"),
       detectedName: detectedName ? detectedName : (data.detectedName || null),
       confidence: detectedLms !== "unsure_research" ? confidence : (data.confidence || 75),
-      explanation: detectedLms !== "unsure_research" 
-        ? `${explanation} Scraped audit notes: ${data.explanation}` 
+      explanation: detectedLms !== "unsure_research"
+        ? `${explanation} Scraped audit notes: ${data.explanation}`
         : (data.explanation || "No certified vendor footprint uncovered. Proceeding with standard trigger templates."),
+      hasLiveResearch,
       sources: finalSources,
       learningNews: finalNews
     };
@@ -855,7 +856,7 @@ Return a standard compliant JSON array of these objects.
 `;
 
     const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.0-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -1041,7 +1042,7 @@ Do not write any markdown wrappers around the JSON. Return only the raw JSON.
 `;
 
     const response = await aiClient.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-2.0-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
