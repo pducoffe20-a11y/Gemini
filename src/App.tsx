@@ -874,7 +874,7 @@ export default function App() {
             <div className="flex items-center gap-2.5">
               <AlertCircle className="w-4.5 h-4.5 text-amber-600 shrink-0" />
               <span>
-                <strong>Notice:</strong> Claude API rate limit reached. The system has automatically activated local heuristic template matching so your campaign outreach and targeting workflows can continue instantly. To restore real-time AI, set your <strong>ANTHROPIC_API_KEY</strong> environment variable.
+                <strong>Notice:</strong> Gemini API quota reached. The system has automatically activated local heuristic template matching so your campaign outreach and targeting workflows can continue instantly. To restore real-time AI research, set your <strong>GEMINI_API_KEY</strong> environment variable.
               </span>
             </div>
             <button 
@@ -1821,7 +1821,7 @@ export default function App() {
                         ? "bg-brand/10 text-brand" 
                         : "bg-amber-400/10 text-amber-400"
                     }`}>
-                      {generationMode === "genai" ? "Claude Live Generated" : "Static Match Draft"}
+                      {generationMode === "genai" ? "Gemini Live Generated" : "Static Match Draft"}
                     </span>
                   </div>
 
